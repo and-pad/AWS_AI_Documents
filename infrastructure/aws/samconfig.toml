@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "document-ai-pipeline"
+resolve_s3 = true
+s3_prefix = "document-ai-pipeline"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "Environment=\"dev\" QueueVisibilityTimeout=\"900\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

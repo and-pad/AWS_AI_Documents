@@ -1,0 +1,26 @@
+**/.aws-sam/
+**/node_modules/
+**/dist/
+**/.env.local
+**/.venv/
+**/.pytest_cache/
+**/*.tsbuildinfo
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Python
+**/__pycache__/
+**/*.py[cod]
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store

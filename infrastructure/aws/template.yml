@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Document AI processing pipeline.
+  S3 -> SQS -> Lambda Worker
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+
+  QueueVisibilityTimeout:
+    Type: Number
+    Default: 900
+    Description: >
+      Time in seconds that a message remains invisible while being processed.
+
+  DocumentProcessorUrl:
+    Type: String
+    Default: http://document-processor:8000/process
+    Description: >
+      Full HTTP URL of the document-processor /process endpoint.
+
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Browser origin allowed to upload and query jobs.
+
+  MaxUploadBytes:
+    Type: Number
+    Default: 20971520
+    Description: Maximum accepted PDF size in bytes.
+
+Globals:
+
+  Function:
+    Runtime: python3.12
+    Timeout: 900
+    MemorySize: 512
+
+Resources:
+
+  # ============================================================
+  # S3 - Document uploads
+  # ============================================================
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - !Ref FrontendOrigin
+            AllowedMethods:
+              - PUT
+            AllowedHeaders:
+              - "*"
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt DocumentQueue.Arn
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResultsAfter30Days
+            Status: Enabled
+            Prefix: results/
+            ExpirationInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+
+  # ============================================================
+  # SQS - Document processing queue
+  # ============================================================
+
+  DocumentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !Ref QueueVisibilityTimeout
+
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+
+  # ============================================================
+  # SQS - Dead Letter Queue
+  # ============================================================
+
+  DocumentDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  JobsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowOrigin: !Sub "'${FrontendOrigin}'"
+        AllowHeaders: "'Content-Type'"
+        AllowMethods: "'GET,POST,OPTIONS'"
+
+
+  # ============================================================
+  # S3 -> SQS permission
+  # ============================================================
+
+  DocumentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DocumentQueue
+
+      PolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+
+            Principal:
+              Service: s3.amazonaws.com
+
+            Action:
+              - sqs:SendMessage
+
+            Resource:
+              - !GetAtt DocumentQueue.Arn
+
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  - !GetAtt DocumentsBucket.Arn
+
+
+  # ============================================================
+  # Lambda Worker
+  # ============================================================
+
+  DocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      CodeUri: ../../worker/
+      Handler: app.worker.lambda_handler
+
+      Environment:
+        Variables:
+          DOCUMENT_PROCESSOR_URL: !Ref DocumentProcessorUrl
+          JOBS_TABLE: !Ref JobsTable
+          RESULTS_BUCKET: !Ref ResultsBucket
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+
+      Description: >
+        Processes documents received from the SQS queue.
+
+      ReservedConcurrentExecutions: 1
+
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+
+      Events:
+
+        DocumentQueueEvent:
+          Type: SQS
+
+          Properties:
+            Queue: !GetAtt DocumentQueue.Arn
+
+            BatchSize: 1
+
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  JobsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../worker/
+      Handler: app.jobs.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          RESULTS_BUCKET: !Ref ResultsBucket
+          CORS_ORIGIN: !Ref FrontendOrigin
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+      Events:
+        CreateJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs
+            Method: POST
+        GetJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{job_id}
+            Method: GET
+
+
+Outputs:
+
+  DocumentsBucketName:
+    Description: S3 bucket used for document uploads
+    Value: !Ref DocumentsBucket
+
+  ResultsBucketName:
+    Description: S3 bucket used for processed document results
+    Value: !Ref ResultsBucket
+
+  JobsTableName:
+    Description: DynamoDB table used for job state and user prompts
+    Value: !Ref JobsTable
+
+  DocumentQueueUrl:
+    Description: SQS document processing queue URL
+    Value: !Ref DocumentQueue
+
+  DocumentQueueArn:
+    Description: SQS document processing queue ARN
+    Value: !GetAtt DocumentQueue.Arn
+
+  DeadLetterQueueUrl:
+    Description: SQS dead letter queue URL
+    Value: !Ref DocumentDeadLetterQueue
+
+  DocumentProcessorFunctionArn:
+    Description: Document processor Lambda ARN
+    Value: !GetAtt DocumentProcessorFunction.Arn
+
+  JobsApiUrl:
+    Description: API base URL for creating and querying document jobs
+    Value: !Sub "https://${JobsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"

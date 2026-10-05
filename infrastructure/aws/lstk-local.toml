@@ -1,0 +1,13 @@
+# LocalStack-specific settings for serial SQS -> Lambda processing.
+# Standard SQS event mappings otherwise start five pollers by default; with
+# ReservedConcurrentExecutions=1, the extra pollers can receive messages and
+# immediately hit Lambda throttling while the current PDF is still running.
+[[containers]]
+type = "aws"
+tag = "latest"
+port = "4566"
+env = ["serial_document_queue"]
+
+[env.serial_document_queue]
+LAMBDA_EVENT_SOURCE_MAPPING_SQS_POLLER_COUNT = "1"
+PERSISTENCE = "1"

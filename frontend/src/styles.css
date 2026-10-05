@@ -1,0 +1,36 @@
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #172033;
+  background: #f6f7fb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button, input, textarea { font: inherit; }
+.container { width: min(860px, calc(100% - 32px)); margin: 56px auto; }
+header { margin-bottom: 28px; }
+.eyebrow { color: #5967a8; font-size: .78rem; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+h1 { margin: 8px 0; font-size: clamp(2rem, 5vw, 3rem); letter-spacing: -.045em; }
+.intro { color: #687187; }
+.panel { padding: 24px; margin: 18px 0; background: white; border: 1px solid #e5e8f0; border-radius: 14px; box-shadow: 0 8px 26px #26345a0a; }
+.form { display: grid; gap: 12px; }
+label { font-weight: 650; }
+input[type="file"], textarea { width: 100%; padding: 12px; border: 1px solid #d5d9e4; border-radius: 8px; background: #fff; }
+textarea { resize: vertical; }
+.file-info, .job-id { color: #687187; font-size: .9rem; overflow-wrap: anywhere; }
+button { justify-self: start; border: 0; border-radius: 8px; padding: 11px 18px; color: white; background: #4757a8; cursor: pointer; font-weight: 650; }
+button:disabled { opacity: .55; cursor: wait; }
+.error { color: #a12735; background: #fff0f1; border-radius: 8px; padding: 12px; }
+.status-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+h2 { font-size: 1.15rem; margin: 12px 0; }
+.status { border-radius: 999px; background: #edf0fa; color: #394b9c; padding: 6px 11px; font-size: .8rem; font-weight: 700; }
+.status-completed { background: #e8f6ed; color: #24653d; }
+.status-failed { background: #fff0f1; color: #a12735; }
+.analysis { white-space: pre-wrap; line-height: 1.65; overflow-wrap: anywhere; }
+.results { margin-top: 28px; }
+details { border-top: 1px solid #e8eaf0; padding: 14px 0; }
+summary { cursor: pointer; font-weight: 650; }
+details .analysis { padding: 14px 4px 4px; }
+@media (max-width: 560px) { .container { margin: 28px auto; } .panel { padding: 18px; } }
