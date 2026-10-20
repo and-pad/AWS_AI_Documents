@@ -1,0 +1,201 @@
+# Resource fragments for api domain.
+  JobsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowOrigin: !Sub "'${FrontendOrigin}'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,DELETE,OPTIONS'"
+      Auth:
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+
+  DocumentProcessorFunction:
+    Type: AWS::Serverless::Function
+
+    Properties:
+      CodeUri: ../../worker/
+      Handler: app.worker.lambda_handler
+
+      Environment:
+        Variables:
+          DOCUMENT_PROCESSOR_URL: !If
+            - DeployProcessorOnFargate
+            - !Sub "http://document-processor.${Environment}.internal:8000/process"
+            - !Ref DocumentProcessorUrl
+          JOBS_TABLE: !Ref JobsTable
+          RESULTS_BUCKET: !Ref ResultsBucket
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+      VpcConfig:
+        Fn::If:
+          - DeployProcessorOnFargate
+          - SubnetIds:
+              - !Ref ProcessorPublicSubnet
+            SecurityGroupIds:
+              - !GetAtt ProcessorLambdaSecurityGroup.GroupId
+          - Ref: AWS::NoValue
+
+      Description: >
+        Processes documents received from the SQS queue.
+
+      #ReservedConcurrentExecutions: 1
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateNetworkInterface
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DescribeSubnets
+                - ec2:DeleteNetworkInterface
+                - ec2:AssignPrivateIpAddresses
+                - ec2:UnassignPrivateIpAddresses
+              Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource:
+                - !Sub "${DocumentsBucket.Arn}/jobs/*"
+                - !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource:
+                - !Sub "${DocumentsBucket.Arn}/jobs/*"
+                - !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+
+  # LocalStack continues to use the existing Lambda path. In AWS/Fargate this
+  # condition is false, so only the Fargate task can consume DocumentQueue.
+  DocumentProcessorFunctionDocumentQueueEvent:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: UseLegacyLambdaProcessor
+    Properties:
+      EventSourceArn: !GetAtt DocumentQueue.Arn
+      FunctionName: !Ref DocumentProcessorFunction
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  JobsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../worker/
+      Handler: app.jobs.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          RESULTS_BUCKET: !Ref ResultsBucket
+          CORS_ORIGIN: !Ref FrontendOrigin
+          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+          MAX_USER_JOBS: !Ref MaxUserJobs
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt DocumentsBucket.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt ResultsBucket.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt JobsTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${JobsTable.Arn}/index/UserJobsIndex"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "${ResultsBucket.Arn}/results/*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !GetAtt ResultsBucket.Arn
+      Events:
+        CreateJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        ListJobs:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{job_id}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+        DeleteJob:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{job_id}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer

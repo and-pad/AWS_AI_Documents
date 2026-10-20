@@ -1,4 +1,5 @@
 **/.aws-sam/
+infrastructure/aws/.template-assembled.yml
 **/node_modules/
 **/dist/
 **/.env.local

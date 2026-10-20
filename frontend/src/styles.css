@@ -20,8 +20,11 @@ label { font-weight: 650; }
 input[type="file"], textarea { width: 100%; padding: 12px; border: 1px solid #d5d9e4; border-radius: 8px; background: #fff; }
 textarea { resize: vertical; }
 .file-info, .job-id { color: #687187; font-size: .9rem; overflow-wrap: anywhere; }
+.job-progress { display: grid; gap: 8px; margin: 14px 0; }
 button { justify-self: start; border: 0; border-radius: 8px; padding: 11px 18px; color: white; background: #4757a8; cursor: pointer; font-weight: 650; }
 button:disabled { opacity: .55; cursor: wait; }
+.secondary { color: #394b9c; background: #edf0fa; }
+.account-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; color: #687187; }
 .error { color: #a12735; background: #fff0f1; border-radius: 8px; padding: 12px; }
 .status-line { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 h2 { font-size: 1.15rem; margin: 12px 0; }

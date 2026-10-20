@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +8,27 @@ from starlette.concurrency import run_in_threadpool
 from app.document_service import process_pdf
 from app.ollama_client import OllamaError
 from app.settings import get_settings
+from app.sqs_worker import SqsDocumentWorker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-app = FastAPI(title="document-processor")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Uvicorn is intentionally started without --workers. This creates exactly
+    # one long-poll consumer per ECS task while the API event loop stays free
+    # for health checks and local diagnostic requests.
+    worker = SqsDocumentWorker()
+    worker.start()
+    app.state.sqs_worker = worker
+    try:
+        yield
+    finally:
+        worker.stop()
+
+
+app = FastAPI(title="document-processor", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings["cors_origins"],
@@ -40,8 +56,8 @@ async def process_document(file: UploadFile = File(...), user_prompt: str | None
         return await run_in_threadpool(process_pdf, file.filename or "document.pdf", contents, user_prompt, None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except OllamaError as exc:
-        logger.error("Falló Ollama para filename=%s: %s", file.filename, exc)
-        raise HTTPException(status_code=502, detail="El proveedor de análisis documental no está disponible") from exc
+    except OllamaError:
+        logger.error("Falló Ollama para filename=%s", file.filename)
+        raise HTTPException(status_code=502, detail="El proveedor de análisis documental no está disponible") from None
     finally:
         contents = b""

@@ -1,13 +1,16 @@
 version = 0.1
 
+# The source manifest is assembled before SAM commands. The real deployment
+# uses Ohio; deploy-local.sh overrides the region to us-east-1 for LocalStack.
 [default.deploy.parameters]
 stack_name = "document-ai-pipeline"
 resolve_s3 = true
 s3_prefix = "document-ai-pipeline"
-region = "us-east-1"
+region = "us-east-2"
 capabilities = "CAPABILITY_IAM"
 parameter_overrides = "Environment=\"dev\" QueueVisibilityTimeout=\"900\""
 image_repositories = []
+confirm_changeset = true
 
 [default.global.parameters]
-region = "us-east-1"
+region = "us-east-2"

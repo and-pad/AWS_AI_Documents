@@ -4,3 +4,5 @@ python-multipart
 requests
 PyMuPDF
 python-dotenv
+pydantic>=2,<3
+boto3>=1.34

@@ -8,9 +8,13 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:8b}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-${OLLAMA_URL:-http://host.docker.internal:11434}}
+      OLLAMA_API_TOKEN: ${OLLAMA_API_TOKEN:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:8b-instruct}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
       PDF_RENDER_DPI: ${PDF_RENDER_DPI:-180}
+      DEBUG_MODEL_OUTPUT: ${DEBUG_MODEL_OUTPUT:-false}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-16384}
+      OLLAMA_READ_TIMEOUT: ${OLLAMA_READ_TIMEOUT:-1200}
     restart: unless-stopped

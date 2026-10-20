@@ -1,0 +1,219 @@
+# Resource fragments for processor domain.
+  DocumentProcessorRepository:
+    Type: AWS::ECR::Repository
+    Condition: DeployProcessorOnFargate
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-${Environment}-document-processor"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep the five most recent images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  ProcessorCluster:
+    Type: AWS::ECS::Cluster
+    Condition: DeployProcessorOnFargate
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-${Environment}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  ProcessorTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployProcessorOnFargate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PullProcessorImageAndWriteLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !GetAtt DocumentProcessorRepository.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProcessorLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OllamaApiTokenSecret
+
+  ProcessorTaskRole:
+    Type: AWS::IAM::Role
+    Condition: DeployProcessorOnFargate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConsumeDocumentsAndPersistJobs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DocumentQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "${DocumentsBucket.Arn}/jobs/*"
+                  - !Sub "${DocumentsBucket.Arn}/users/*/jobs/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${ResultsBucket.Arn}/results/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt JobsTable.Arn
+
+  OllamaApiTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: DeployProcessorOnFargate
+    Properties:
+      Name: !Sub "${AWS::StackName}-${Environment}-ollama-api-token"
+      Description: Bearer token used by document-processor to authenticate to the Ollama HTTPS proxy.
+
+  ProcessorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: DeployProcessorOnFargate
+    Properties:
+      Family: !Sub "${AWS::StackName}-${Environment}-document-processor"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt ProcessorTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProcessorTaskRole.Arn
+      ContainerDefinitions:
+        - Name: document-processor
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${DocumentProcessorRepository}:${DocumentProcessorImageTag}"
+          Essential: true
+          StopTimeout: 60
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: OLLAMA_BASE_URL
+              Value: !Ref OllamaBaseUrl
+            - Name: OLLAMA_MODEL
+              Value: !Ref OllamaModel
+            - Name: MAX_UPLOAD_BYTES
+              Value: !Ref MaxUploadBytes
+            - Name: PDF_RENDER_DPI
+              Value: '180'
+            - Name: CONTEXT_MAX_CHARS
+              Value: '3000'
+            - Name: DEBUG_MODEL_OUTPUT
+              Value: !Ref DebugModelOutput
+            - Name: DOCUMENT_QUEUE_URL
+              Value: !Ref DocumentQueue
+            - Name: DOCUMENTS_BUCKET
+              Value: !Ref DocumentsBucket
+            - Name: RESULTS_BUCKET
+              Value: !Ref ResultsBucket
+            - Name: JOBS_TABLE
+              Value: !Ref JobsTable
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_WAIT_TIME_SECONDS
+              Value: '20'
+            - Name: SQS_VISIBILITY_TIMEOUT
+              Value: !Ref QueueVisibilityTimeout
+            - Name: SQS_VISIBILITY_HEARTBEAT_SECONDS
+              Value: !Ref SqsVisibilityHeartbeatSeconds
+            - Name: SQS_MAX_RECEIVE_COUNT
+              Value: '3'
+            - Name: OLLAMA_READ_TIMEOUT
+              Value: !Ref OllamaReadTimeout
+            - Name: OLLAMA_NUM_CTX
+              Value: !Ref OllamaNumCtx
+          Secrets:
+            - Name: OLLAMA_API_TOKEN
+              ValueFrom: !Ref OllamaApiTokenSecret
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ProcessorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: processor
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployProcessorOnFargate
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-${Environment}-document-processor"
+      RetentionInDays: 14
+
+  ProcessorService:
+    Type: AWS::ECS::Service
+    Condition: DeployProcessorOnFargate
+    DependsOn:
+      - ProcessorSubnetRouteAssociation
+    Properties:
+      ServiceName: document-processor
+      Cluster: !Ref ProcessorCluster
+      TaskDefinition: !Ref ProcessorTaskDefinition
+      DesiredCount: !Ref DocumentProcessorDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref ProcessorPublicSubnet
+          SecurityGroups:
+            - !GetAtt ProcessorTaskSecurityGroup.GroupId
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ProcessorDiscoveryService.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ============================================================
+  # S3 -> SQS permission
+  # ============================================================

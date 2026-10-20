@@ -1,0 +1,62 @@
+# Resource fragments for messaging domain.
+  DocumentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !Ref QueueVisibilityTimeout
+
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+
+  # ============================================================
+  # SQS - Dead Letter Queue
+  # ============================================================
+
+  DocumentDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  DocumentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DocumentQueue
+
+      PolicyDocument:
+        Version: '2012-10-17'
+
+        Statement:
+          - Sid: AllowS3ToSendMessages
+            Effect: Allow
+
+            Principal:
+              Service: s3.amazonaws.com
+
+            Action:
+              - sqs:SendMessage
+
+            Resource:
+              - !GetAtt DocumentQueue.Arn
+
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+
+  # ============================================================
+  # Lambda Worker
+  # ============================================================

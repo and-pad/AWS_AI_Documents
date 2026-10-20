@@ -1,0 +1,158 @@
+# Resource fragments for processor-network domain.
+  ProcessorVpc:
+    Type: AWS::EC2::VPC
+    Condition: DeployProcessorOnFargate
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${Environment}-processor-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProcessorInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: DeployProcessorOnFargate
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${Environment}-processor-igw"
+
+  ProcessorInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: DeployProcessorOnFargate
+    Properties:
+      VpcId: !Ref ProcessorVpc
+      InternetGatewayId: !Ref ProcessorInternetGateway
+
+  ProcessorPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: DeployProcessorOnFargate
+    Properties:
+      VpcId: !Ref ProcessorVpc
+      CidrBlock: !Ref PublicSubnetCidr
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${Environment}-processor-public"
+
+  ProcessorPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: DeployProcessorOnFargate
+    Properties:
+      VpcId: !Ref ProcessorVpc
+
+  ProcessorPublicRoute:
+    Type: AWS::EC2::Route
+    Condition: DeployProcessorOnFargate
+    DependsOn: ProcessorInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref ProcessorPublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ProcessorInternetGateway
+
+  ProcessorSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: DeployProcessorOnFargate
+    Properties:
+      SubnetId: !Ref ProcessorPublicSubnet
+      RouteTableId: !Ref ProcessorPublicRouteTable
+
+  ProcessorS3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: DeployProcessorOnFargate
+    Properties:
+      VpcId: !Ref ProcessorVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref ProcessorPublicRouteTable
+
+  ProcessorDynamoDbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: DeployProcessorOnFargate
+    Properties:
+      VpcId: !Ref ProcessorVpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.dynamodb"
+      RouteTableIds:
+        - !Ref ProcessorPublicRouteTable
+
+  ProcessorLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployProcessorOnFargate
+    Properties:
+      GroupDescription: Egress from the SQS worker to the private processor service.
+      VpcId: !Ref ProcessorVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${Environment}-worker"
+
+  ProcessorTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployProcessorOnFargate
+    Properties:
+      GroupDescription: Private inbound from worker; outbound HTTPS and Ollama only.
+      VpcId: !Ref ProcessorVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 11443
+          ToPort: 11443
+          CidrIp: !Ref OllamaIPv4Cidr
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-${Environment}-processor-task"
+
+  ProcessorIngressFromWorker:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: DeployProcessorOnFargate
+    Properties:
+      GroupId: !GetAtt ProcessorTaskSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      SourceSecurityGroupId: !GetAtt ProcessorLambdaSecurityGroup.GroupId
+
+  WorkerEgressToProcessor:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: DeployProcessorOnFargate
+    Properties:
+      GroupId: !GetAtt ProcessorLambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      DestinationSecurityGroupId: !GetAtt ProcessorTaskSecurityGroup.GroupId
+
+  ProcessorNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Condition: DeployProcessorOnFargate
+    Properties:
+      Name: !Sub "${Environment}.internal"
+      Vpc: !Ref ProcessorVpc
+      Description: Private DNS namespace for the document processor service.
+
+  ProcessorDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Condition: DeployProcessorOnFargate
+    Properties:
+      Name: document-processor
+      NamespaceId: !GetAtt ProcessorNamespace.Id
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1

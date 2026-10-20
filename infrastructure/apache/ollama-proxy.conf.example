@@ -1,0 +1,33 @@
+# Apache 2.4 reference vhost. Enable the standard modules:
+# ssl, proxy, proxy_http, setenvif, authz_core, log_config
+# OLLAMA_API_TOKEN is supplied to Apache out of band. Do not put its value
+# in this tracked reference configuration.
+
+Listen 11443
+
+<VirtualHost *:11443>
+    ServerName la-ea.duckdns.org
+
+    SSLEngine on
+    SSLCertificateFile /etc/letsencrypt/live/la-ea.duckdns.org/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/la-ea.duckdns.org/privkey.pem
+    SSLProtocol -all +TLSv1.2 +TLSv1.3
+
+    ProxyRequests Off
+    # Must exceed document-processor OLLAMA_READ_TIMEOUT (1200 by default).
+    ProxyTimeout 1300
+
+    # The comparison runs before proxying. Missing/wrong Authorization is denied.
+    SetEnvIfExpr "req('Authorization') == 'Bearer ${OLLAMA_API_TOKEN}'" ollama_token_valid
+    <Location "/">
+        Require env ollama_token_valid
+    </Location>
+
+    # Ollama remains bound to loopback; this vhost exposes only that backend.
+    ProxyPass        "/" "http://127.0.0.1:11434/" connectiontimeout=5 timeout=1300
+    ProxyPassReverse "/" "http://127.0.0.1:11434/"
+
+    ErrorLog  ${APACHE_LOG_DIR}/ollama-proxy-error.log
+    # Deliberately omit request headers; never add Authorization to a LogFormat.
+    CustomLog ${APACHE_LOG_DIR}/ollama-proxy-access.log "%h %l %u %t \"%r\" %>s %b"
+</VirtualHost>

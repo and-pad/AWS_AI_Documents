@@ -3,7 +3,7 @@ Transform: AWS::Serverless-2016-10-31
 
 Description: >
   Document AI processing pipeline.
-  S3 -> SQS -> Lambda Worker
+  S3 -> SQS -> Fargate document worker
 
 Parameters:
 
@@ -20,11 +20,79 @@ Parameters:
     Description: >
       Time in seconds that a message remains invisible while being processed.
 
+  SqsVisibilityHeartbeatSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    Description: Interval at which the Fargate worker renews SQS visibility and its DynamoDB lease.
+
+  OllamaReadTimeout:
+    Type: Number
+    Default: 1200
+    MinValue: 60
+    Description: Read timeout in seconds for one page request from Fargate to Ollama.
+
+  OllamaNumCtx:
+    Type: Number
+    Default: 16384
+    MinValue: 4096
+    Description: Ollama context per request; must fit the rendered image and thinking pass without truncation.
+
   DocumentProcessorUrl:
     Type: String
     Default: http://document-processor:8000/process
     Description: >
-      Full HTTP URL of the document-processor /process endpoint.
+      Local mode only: full HTTP URL of the local document-processor endpoint.
+
+  ProcessorDeployment:
+    Type: String
+    Default: fargate
+    AllowedValues:
+      - local
+      - fargate
+    Description: Use the existing local processor endpoint or the AWS Fargate service.
+
+  OllamaBaseUrl:
+    Type: String
+    Default: https://la-ea.duckdns.org:11443
+    Description: HTTPS endpoint for the Ollama reverse proxy; TLS verification remains enabled.
+
+  OllamaIPv4Cidr:
+    Type: String
+    Default: 99.35.202.200/32
+    Description: Destination range allowed for document-processor Ollama traffic.
+
+  OllamaModel:
+    Type: String
+    Default: qwen3-vl:8b-instruct
+
+  DebugModelOutput:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'false'
+      - 'true'
+    Description: Temporarily log bounded raw Ollama output fragments after structured-output validation failures.
+
+  DocumentProcessorImageTag:
+    Type: String
+    Default: latest
+    Description: Image tag pushed to the stack's ECR repository.
+
+  DocumentProcessorDesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 2
+    Description: Start at zero until the image is pushed to ECR, then update to one.
+
+  VpcCidr:
+    Type: String
+    Default: 10.40.0.0/16
+
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.40.1.0/24
 
   FrontendOrigin:
     Type: String
@@ -36,6 +104,12 @@ Parameters:
     Default: 20971520
     Description: Maximum accepted PDF size in bytes.
 
+  MaxUserJobs:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    Description: Maximum number of retained jobs and results per Cognito user.
+
 Globals:
 
   Function:
@@ -43,251 +117,19 @@ Globals:
     Timeout: 900
     MemorySize: 512
 
-Resources:
+Conditions:
+  DeployProcessorOnFargate: !Equals [!Ref ProcessorDeployment, fargate]
+  UseLegacyLambdaProcessor: !Equals [!Ref ProcessorDeployment, local]
 
-  # ============================================================
-  # S3 - Document uploads
-  # ============================================================
+Modules:
+  - stacks/auth.yml
+  - stacks/storage.yml
+  - stacks/messaging.yml
+  - stacks/processor-network.yml
+  - stacks/processor.yml
+  - stacks/api.yml
 
-  DocumentsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-
-      CorsConfiguration:
-        CorsRules:
-          - AllowedOrigins:
-              - !Ref FrontendOrigin
-            AllowedMethods:
-              - PUT
-            AllowedHeaders:
-              - "*"
-            ExposedHeaders:
-              - ETag
-            MaxAge: 3000
-
-      NotificationConfiguration:
-        QueueConfigurations:
-          - Event: s3:ObjectCreated:*
-            Queue: !GetAtt DocumentQueue.Arn
-
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: document-ai-pipeline
-
-  ResultsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireResultsAfter30Days
-            Status: Enabled
-            Prefix: results/
-            ExpirationInDays: 30
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: document-ai-pipeline
-
-
-  # ============================================================
-  # SQS - Document processing queue
-  # ============================================================
-
-  DocumentQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      VisibilityTimeout: !Ref QueueVisibilityTimeout
-
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt DocumentDeadLetterQueue.Arn
-        maxReceiveCount: 3
-
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: document-ai-pipeline
-
-
-  # ============================================================
-  # SQS - Dead Letter Queue
-  # ============================================================
-
-  DocumentDeadLetterQueue:
-    Type: AWS::SQS::Queue
-    Properties:
-      MessageRetentionPeriod: 1209600
-
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: document-ai-pipeline
-
-  JobsTable:
-    Type: AWS::DynamoDB::Table
-    Properties:
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: job_id
-          AttributeType: S
-      KeySchema:
-        - AttributeName: job_id
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
-      Tags:
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Project
-          Value: document-ai-pipeline
-
-  JobsApi:
-    Type: AWS::Serverless::Api
-    Properties:
-      StageName: !Ref Environment
-      Cors:
-        AllowOrigin: !Sub "'${FrontendOrigin}'"
-        AllowHeaders: "'Content-Type'"
-        AllowMethods: "'GET,POST,OPTIONS'"
-
-
-  # ============================================================
-  # S3 -> SQS permission
-  # ============================================================
-
-  DocumentQueuePolicy:
-    Type: AWS::SQS::QueuePolicy
-    Properties:
-      Queues:
-        - !Ref DocumentQueue
-
-      PolicyDocument:
-        Version: '2012-10-17'
-
-        Statement:
-          - Sid: AllowS3ToSendMessages
-            Effect: Allow
-
-            Principal:
-              Service: s3.amazonaws.com
-
-            Action:
-              - sqs:SendMessage
-
-            Resource:
-              - !GetAtt DocumentQueue.Arn
-
-            Condition:
-              ArnLike:
-                aws:SourceArn:
-                  - !GetAtt DocumentsBucket.Arn
-
-
-  # ============================================================
-  # Lambda Worker
-  # ============================================================
-
-  DocumentProcessorFunction:
-    Type: AWS::Serverless::Function
-
-    Properties:
-      CodeUri: ../../worker/
-      Handler: app.worker.lambda_handler
-
-      Environment:
-        Variables:
-          DOCUMENT_PROCESSOR_URL: !Ref DocumentProcessorUrl
-          JOBS_TABLE: !Ref JobsTable
-          RESULTS_BUCKET: !Ref ResultsBucket
-          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
-
-      Description: >
-        Processes documents received from the SQS queue.
-
-      ReservedConcurrentExecutions: 1
-
-      Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref DocumentsBucket
-        - DynamoDBCrudPolicy:
-            TableName: !Ref JobsTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - s3:PutObject
-              Resource: !Sub "${ResultsBucket.Arn}/results/*"
-
-      Events:
-
-        DocumentQueueEvent:
-          Type: SQS
-
-          Properties:
-            Queue: !GetAtt DocumentQueue.Arn
-
-            BatchSize: 1
-
-            FunctionResponseTypes:
-              - ReportBatchItemFailures
-
-  JobsApiFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ../../worker/
-      Handler: app.jobs.lambda_handler
-      Timeout: 30
-      MemorySize: 256
-      Environment:
-        Variables:
-          JOBS_TABLE: !Ref JobsTable
-          DOCUMENTS_BUCKET: !Ref DocumentsBucket
-          RESULTS_BUCKET: !Ref ResultsBucket
-          CORS_ORIGIN: !Ref FrontendOrigin
-          MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref JobsTable
-        - Statement:
-            - Effect: Allow
-              Action:
-                - s3:PutObject
-              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
-            - Effect: Allow
-              Action:
-                - s3:GetObject
-              Resource: !Sub "${DocumentsBucket.Arn}/jobs/*"
-            - Effect: Allow
-              Action:
-                - s3:GetObject
-              Resource: !Sub "${ResultsBucket.Arn}/results/*"
-      Events:
-        CreateJob:
-          Type: Api
-          Properties:
-            RestApiId: !Ref JobsApi
-            Path: /jobs
-            Method: POST
-        GetJob:
-          Type: Api
-          Properties:
-            RestApiId: !Ref JobsApi
-            Path: /jobs/{job_id}
-            Method: GET
-
-
+# Source manifest: assemble with assemble_template.py before SAM commands.
 Outputs:
 
   DocumentsBucketName:
@@ -321,3 +163,45 @@ Outputs:
   JobsApiUrl:
     Description: API base URL for creating and querying document jobs
     Value: !Sub "https://${JobsApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for the SPA
+    Value: !Ref UserPool
+
+  CognitoUserPoolClientId:
+    Description: Public Cognito User Pool Client ID for the SPA
+    Value: !Ref UserPoolClient
+
+  CognitoRegion:
+    Description: AWS region containing the Cognito User Pool
+    Value: !Ref AWS::Region
+
+  DocumentProcessorRepositoryUri:
+    Condition: DeployProcessorOnFargate
+    Description: ECR repository URI for the document-processor container
+    Value: !GetAtt DocumentProcessorRepository.RepositoryUri
+
+  OllamaApiTokenSecretArn:
+    Condition: DeployProcessorOnFargate
+    Description: Empty Secrets Manager secret; set its value before starting Fargate tasks.
+    Value: !Ref OllamaApiTokenSecret
+
+  DocumentProcessorClusterName:
+    Condition: DeployProcessorOnFargate
+    Description: ECS cluster hosting document-processor
+    Value: !Ref ProcessorCluster
+
+  DocumentProcessorServiceName:
+    Condition: DeployProcessorOnFargate
+    Description: ECS service hosting document-processor
+    Value: document-processor
+
+  DocumentProcessorPrivateUrl:
+    Condition: DeployProcessorOnFargate
+    Description: Private diagnostic endpoint for the document processor
+    Value: !Sub "http://document-processor.${Environment}.internal:8000/process"
+
+  ProcessorVpcId:
+    Condition: DeployProcessorOnFargate
+    Description: VPC hosting the Fargate document processor
+    Value: !Ref ProcessorVpc
