@@ -8,7 +8,7 @@ resolve_s3 = true
 s3_prefix = "document-ai-pipeline"
 region = "us-east-2"
 capabilities = "CAPABILITY_IAM"
-parameter_overrides = "Environment=\"dev\" QueueVisibilityTimeout=\"900\""
+parameter_overrides = "Environment=\"dev\" QueueVisibilityTimeout=\"900\" FrontendOrigin=\"https://dfw9n3vcykvho.cloudfront.net\""
 image_repositories = []
 confirm_changeset = true
 

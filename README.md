@@ -26,7 +26,7 @@ compose.yaml                      document-processor local
 1. React registra e inicia sesión con Cognito. Las sesiones y su renovación las conserva Amplify en el navegador; React manda el ID token a API Gateway. El Cognito User Pool Authorizer valida el token y JobsApi toma `sub` de los claims autorizados.
 2. React hace `POST /jobs` con nombre, tamaño, tipo y `user_prompt`. JobsApi valida el PDF/tamaño, crea un ID y guarda `user_id=<sub>` en DynamoDB; devuelve una presigned PUT URL de corta duración para `users/{sub}/jobs/{job_id}/{filename}`.
 3. React sube directamente a S3 sin credenciales AWS. La presigned URL exige tipo/tamaño y metadata `x-amz-meta-job-id`. Tras un PUT exitoso, React comienza polling. JobsApi comprueba el objeto y su metadata en el primer `GET /jobs/{job_id}`, verifica ownership y marca el trabajo `QUEUED`; así un job ya subido no permanece etiquetado `UPLOAD_PENDING` mientras espera turno en SQS.
-4. S3 envía el evento a `DocumentQueue`. Una sola task Fargate hace long polling (20 s, un mensaje) y procesa el PDF directamente en el contenedor; no hay una Lambda esperando una llamada HTTP larga. La task adquiere el trabajo mediante una transición condicional y una lease DynamoDB, por lo que mensajes duplicados o una task nueva durante un despliegue no inician dos análisis a la vez. Las keys antiguas `jobs/{job_id}/{filename}` siguen siendo reconocidas.
+4. S3 envía el evento a `DocumentQueue`. Una task Fargate inicia `PROCESSOR_MAX_CONCURRENT_JOBS` consumidores SQS independientes (1 por defecto, máximo 2); cada consumidor hace long polling de un mensaje y no recibe otro hasta terminar el actual. No se reserva un tercer mensaje mientras los dos slots estén ocupados. La task procesa el PDF directamente en el contenedor; no hay una Lambda esperando una llamada HTTP larga. La transición condicional y la lease DynamoDB impiden que mensajes duplicados o una task nueva durante un despliegue inicien el mismo job a la vez. Las keys antiguas `jobs/{job_id}/{filename}` siguen siendo reconocidas.
 5. `document-processor` abre el PDF con PyMuPDF, rasteriza una página cada vez, envía la imagen a Ollama y produce el análisis página a página. Al pedir cada página, incluye un `context_summary` limitado a `CONTEXT_MAX_CHARS`; el modelo lo actualiza con entidades, datos del documento y continuidad relevantes. Los análisis detallados no se reutilizan como contexto y se conservan completos para la consolidación final.
 6. La task guarda el resultado JSON bajo la clave determinística `results/{job_id}.json`, confirma la escritura, persiste `COMPLETED` y `result_key` en DynamoDB y solo entonces elimina el PDF de `DocumentsBucket`. Un retry antes de actualizar DynamoDB vuelve a escribir la misma clave y reemplaza el objeto existente. Si el procesamiento falla, no borra el mensaje ni el PDF: antes del tercer receive vuelve el job a `QUEUED`; en el tercero queda `FAILED` y SQS lo redirige a la DLQ. La API `GET /jobs/{job_id}` solo entrega el resultado si el `sub` coincide con `user_id`.
 
@@ -65,15 +65,33 @@ Las variables disponibles son:
 | `MAX_UPLOAD_BYTES` | `20971520` | Máximo 20 MiB |
 | `PDF_RENDER_DPI` | `180` | Resolución de render de páginas |
 | `CONTEXT_MAX_CHARS` | `3000` | Límite del contexto resumido |
-| `DEBUG_MODEL_OUTPUT` | `false` | Diagnóstico temporal: ante una validación fallida registra longitud, fragmentos inicial/finales de hasta 500 caracteres y metadata de finalización de Ollama. No habilitar con documentos sensibles. |
-| `OLLAMA_READ_TIMEOUT` | `1200` | Límite de una llamada de Ollama por página; no limita la duración total del PDF. |
+| `DEBUG_MODEL_OUTPUT` | `false` | Diagnóstico sensible temporal: solo ante JSON/schema inválido registra en CloudWatch el `message.content` completo de Ollama y metadata de validación. Mantener desactivado salvo una prueba controlada; la retención del log group Fargate es 7 días. |
+| `OLLAMA_READ_TIMEOUT` | `1800` | Límite de una llamada individual a Ollama; no limita la duración total del PDF. |
 | `OLLAMA_NUM_CTX` | `16384` | Contexto enviado en cada extracción/síntesis; incluye imagen, schema, entrada y razonamiento. Ajustarlo requiere medir memoria y calidad en el servidor Ollama. El proxy rechaza el truncamiento/desplazamiento en solicitudes estructuradas. |
+| `OLLAMA_PAGE_NUM_PREDICT` | `6000` | Presupuesto máximo de tokens generados para cada página. |
+| `OLLAMA_SYNTHESIS_NUM_PREDICT` | `2000` | Presupuesto máximo para la síntesis final. |
 | `SQS_VISIBILITY_TIMEOUT` | `900` | Ventana de visibilidad renovable del mensaje de producción. |
 | `SQS_VISIBILITY_HEARTBEAT_SECONDS` | `300` | Intervalo de renovación de visibilidad y lease. |
+| `PROCESSOR_MAX_CONCURRENT_JOBS` | `1` | Consumidores independientes por task Fargate; admite `1` o `2`. Cada job conserva sus páginas secuenciales. |
 
 El endpoint multipart es `POST /process` con campos `file` y `user_prompt` (opcional). `/health` no llama a Ollama. Los errores del proveedor se registran y `/process` contesta 502 sin stack trace.
 
-Cada extracción y su retry usan una sola imagen de la página actual y mensajes nuevos. El retry agrega instrucciones de corrección al mismo mensaje, sin reenviar la salida rechazada y sin forzar temperatura cero. Se conservan JSON Schema, Pydantic y un máximo de dos intentos. No se fija `think` ni `num_predict`: la prueba local con `think=false` siguió generando razonamiento y el límite de 4096 tokens terminó sin contenido. Los logs normales incluyen job/página, dimensiones/hash de imagen y conteos/tiempos del modelo, sin transcripción, prompt ni razonamiento. `DEBUG_MODEL_OUTPUT` permanece desactivado.
+Cada extracción y su retry usan una sola imagen de la página actual y mensajes nuevos. El retry de JSON/schema agrega instrucciones de corrección al mismo mensaje, sin reenviar la salida rechazada y sin forzar temperatura cero; una respuesta marcada por Ollama como limitada/incompleta no se repite inmediatamente con el mismo presupuesto. JSON Schema y Pydantic siguen validándose antes de guardar checkpoints. `OLLAMA_PAGE_NUM_PREDICT` y `OLLAMA_SYNTHESIS_NUM_PREDICT` limitan independientemente la salida de páginas y síntesis; `done_reason=length`, `done=false` o alcanzar el presupuesto sin una señal explícita de parada normal rechaza la salida antes de validarla o persistirla. Una terminación `stop` normal se acepta aunque `eval_count` esté cerca del presupuesto. Sin metadata de terminación, el sistema conserva compatibilidad y valida JSON/Pydantic, pero no puede confirmar truncamiento. Los logs incluyen presupuesto, metadata, estado de terminación y categoría sin transcripción, prompt, razonamiento, token ni respuesta completa. `DEBUG_MODEL_OUTPUT` permanece desactivado.
+
+Después de cada extracción válida, el worker guarda un checkpoint privado e inmutable en `ResultsBucket/checkpoints/{job_id}/` y escribe un manifiesto inmutable. DynamoDB conserva únicamente la key del último manifiesto comprometido bajo la lease actual; no guarda transcripciones. Una entrega SQS posterior valida el manifiesto y los checkpoints contra el PDF descargado, la versión Pydantic y la huella de configuración; solo recupera una secuencia contigua desde la página 1. Si falta o no valida una página, se vuelve a extraer desde esa página. La síntesis usa las extracciones recuperadas y nuevas en orden, por lo que un fallo de síntesis solo repite esa etapa. Al persistir `COMPLETED`, se eliminan los checkpoints; una regla Lifecycle limitada a `checkpoints/` los expira tras 30 días como respaldo. `results/` no tiene esa expiración. Los checkpoints no contienen imágenes ni se exponen en la API.
+
+### Diagnóstico después de una prueba AWS
+
+Después de que un job termine o falle, ejecuta una sola vez:
+
+```bash
+AWS_PROFILE=document-ai-ohio python3 scripts/diagnose_job.py <JOB_ID> \
+  --stack document-ai-pipeline --region us-east-2 --window-minutes 120
+```
+
+El script descubre nombres físicos desde CloudFormation, lee el item DynamoDB, métricas SQS, eventos/logs ECS/Lambda, tasks recientes y métricas CPU/memoria. No llama `ReceiveMessage`, no cambia visibilidad y no mantiene polling. Limita los logs a una ventana y hasta 500 eventos por consulta. Genera un reporte local con permisos `0600`; si el debug sensible estuvo activo, el reporte puede contener la respuesta completa de Ollama. Compártelo únicamente por un canal privado. Requiere permisos de solo lectura para CloudFormation describe, DynamoDB `GetItem`, SQS `GetQueueAttributes`, ECS list/describe, CloudWatch Logs `FilterLogEvents` y CloudWatch `GetMetricStatistics`.
+
+Para habilitar temporalmente la captura exacta en CloudWatch, despliega `DebugModelOutput=true` únicamente durante una prueba controlada y vuelve a desplegarlo como `false` al terminar. El contenido se conserva en el log group ECS existente, que CloudFormation configura con 7 días de retención; el Task Execution Role solo escribe allí y no recibe permisos de lectura nuevos. CloudWatch no permite borrar un evento individual: si se requiere borrado inmediato, eliminar el log stream de la task afectada elimina todos sus logs; de otro modo la retención los expira automáticamente.
 
 Las llamadas estructuradas envían `truncate=false` y `shift=false`: un contexto insuficiente debe fallar explícitamente en vez de descartar la imagen/entrada y producir JSON sin fundamento. En Ollama 0.24.0 el modo estructurado con razonamiento reconstruye internamente el prompt para una segunda generación, por lo que el contexto debe incluir también ese razonamiento.
 
@@ -92,6 +110,10 @@ npm run dev
 ```
 
 Abre `http://localhost:5173`. El cliente Cognito es público y no tiene secret. El navegador solo conoce el API, los identificadores públicos de Cognito, los JWT y la URL temporal prefirmada; no recibe credenciales AWS.
+
+### CORS por entorno
+
+`FrontendOrigin` configura el origen permitido tanto en el preflight de API Gateway y las respuestas de `JobsApiFunction` como en el PUT directo a `DocumentsBucket`. LocalStack lo fija explícitamente en `http://localhost:5173` desde `infrastructure/aws/deploy-local.sh`. Para AWS, el default y `samconfig.toml` usan `https://dfw9n3vcykvho.cloudfront.net`; puede sobrescribirse en el despliegue con `FrontendOrigin=<origen>`.
 
 El formulario permite enviar otro PDF en cuanto termina el PUT anterior, sin esperar a que concluya el análisis. Mantiene una lista/polling independiente por job para que A, B y C puedan estar visibles a la vez.
 
@@ -137,7 +159,25 @@ Cada `POST /jobs` reserva un slot mediante una transacción DynamoDB que increme
 
 ## document-processor en AWS
 
-La imagen ejecuta FastAPI y un único consumidor SQS en la misma task ECS/Fargate. El consumidor invoca `document_service.process_pdf(...)` directamente en el proceso; `/process` y Cloud Map se conservan para diagnóstico/local y rollback, pero no forman parte del camino productivo. ECS registra las IP privadas de sus tasks en Cloud Map y el health check continúa usando `/health`.
+La imagen ejecuta FastAPI y hasta dos consumidores SQS en la misma task ECS/Fargate. Cada slot tiene su propio long poll, receipt handle, lease, heartbeat y estado de job. Los clientes boto3 de servicio se comparten donde son thread-safe; DynamoDB resource se crea por hilo. `document_service.process_pdf(...)` invoca páginas en secuencia dentro de cada job y mantiene un `context_summary` local a ese documento. `/process` y Cloud Map se conservan para diagnóstico/local y rollback, pero no forman parte del camino productivo. ECS registra las IP privadas de sus tasks en Cloud Map y `/health` comprueba que todos los consumidores configurados sigan vivos; una inferencia larga no vuelve unhealthy al servicio, pero un consumidor terminado devuelve HTTP 503 para que ECS reemplace la task.
+
+`ProcessorMaxConcurrentJobs` controla el máximo por task y admite `1` o `2`; el default sigue siendo `1` para que el aumento se active explícitamente. Con `DocumentProcessorDesiredCount=1` y `ProcessorMaxConcurrentJobs=2`, habrá como máximo dos jobs activos en la task. Si más adelante se eleva el desired count, la capacidad agregada será `desiredCount × ProcessorMaxConcurrentJobs`. El CPU/memoria de task se mantiene en 0.25 vCPU/1 GiB: como Ollama corre fuera de Fargate y se rasteriza una página por job a la vez, la memoria adicional esperada es principalmente hasta dos PDFs/imágenes en proceso; no se aumentó sin mediciones de carga concurrente. Conviene revisar métricas ECS después de activar los dos slots.
+
+El servidor local inspeccionado corre Ollama `0.40.2`; no tiene `OLLAMA_NUM_PARALLEL` configurado, cuyo default documentado es `1`. Por tanto, dos jobs Fargate enviarán solicitudes HTTP simultáneas, pero no se debe asumir que Ollama inferirá ambas a la vez. La documentación/código actual de Ollama indica que ciertas arquitecturas, incluida `qwen3vl`, pueden forzarse a un slot por limitaciones del modelo; además la memoria requerida escala con `OLLAMA_NUM_PARALLEL × OLLAMA_CONTEXT_LENGTH` ([FAQ de Ollama](https://github.com/ollama/ollama/blob/main/docs/faq.mdx), [programador de Ollama](https://github.com/ollama/ollama/blob/main/server/sched.go)). No recomendamos habilitarlo aún: la GTX 1070 tiene 8 GiB y el contexto está en 16.384; hay que verificar la memoria con el modelo cargado antes de probar dos slots.
+
+Para probar dos slots en el host Ollama solo después de validar memoria, añade el override sin reemplazar otros valores del servicio:
+
+```bash
+sudo systemctl edit ollama
+# En el editor, dentro de [Service]:
+# Environment="OLLAMA_NUM_PARALLEL=2"
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+El override solo solicita el valor; no confirma dos slots efectivos para `qwen3-vl`. Antes de asumir concurrencia, revisa el journal por el aviso `model architecture does not currently support parallel requests` y observa el runner con `ollama ps` durante una prueba controlada posterior. Para revertir, vuelve a `sudo systemctl edit ollama`, elimina únicamente la línea de `OLLAMA_NUM_PARALLEL` agregada, conserva `OLLAMA_HOST=127.0.0.1:11434` y cualquier otro override existente, luego ejecuta los mismos `daemon-reload` y `restart`. No uses `systemctl revert`, porque podría eliminar overrides ajenos a este cambio.
+
+En SIGTERM, el worker deja de long-pollear y espera hasta 45 segundos para que sus consumidores terminen ordenadamente, dentro del `StopTimeout=60` de ECS. Durante esa espera los jobs activos conservan heartbeat y lease. Si una inferencia tarda más, la task puede terminar antes de completar: no confirma el mensaje, conserva checkpoints ya confirmados y SQS lo vuelve a entregar cuando vence la visibilidad; la nueva task reanuda desde checkpoints. Un mensaje recibido justo al comenzar el apagado tampoco se procesa ni se confirma y puede permanecer invisible hasta vencer su ventana de visibilidad.
 
 La task Fargate está preparada en una subnet pública con asignación de IP pública y ruta al Internet Gateway para descargar la imagen de ECR, enviar logs, hacer long polling de SQS y llamar al proxy HTTPS de Ollama. AWS requiere una IP pública en la task para el egress directo por IGW; la Lambda no recibe IP pública por estar en la subnet pública ([networking Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-networking.html), [IGW y direcciones públicas](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html)). La IP pública no implica que el puerto 8000 quede abierto: no hay ingress público. El security group mantiene TCP 11443 únicamente a `OllamaIPv4Cidr` (`99.35.202.200/32`). La regla separada TCP 443 a `0.0.0.0/0` permite a Fargate alcanzar SQS y los endpoints públicos de ECR, CloudWatch Logs y Secrets Manager; no abre el puerto Ollama a Internet. S3 y DynamoDB usan los endpoints gateway existentes. No se crea NAT Gateway ni ALB. La DNS privada de Cloud Map apunta a la IP privada de la task ([service discovery](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-discovery.html)). Se usa una sola subnet/AZ y una task por costo; esto no ofrece alta disponibilidad ante la caída de esa AZ.
 
@@ -191,7 +231,7 @@ sam deploy \
     Environment=dev ProcessorDeployment=fargate DocumentProcessorDesiredCount=0 \
     OllamaModel=qwen3-vl:8b-instruct \
     OllamaBaseUrl=https://la-ea.duckdns.org:11443 OllamaIPv4Cidr=99.35.202.200/32 \
-    QueueVisibilityTimeout=900 FrontendOrigin=http://localhost:5173
+    QueueVisibilityTimeout=900 FrontendOrigin=https://dfw9n3vcykvho.cloudfront.net
 ```
 
 Obtén el URI de ECR, autentica Docker y sube la imagen construida desde el Dockerfile existente:
@@ -218,7 +258,7 @@ sam deploy \
     Environment=dev ProcessorDeployment=fargate DocumentProcessorDesiredCount=1 \
     OllamaModel=qwen3-vl:8b-instruct \
     OllamaBaseUrl=https://la-ea.duckdns.org:11443 OllamaIPv4Cidr=99.35.202.200/32 \
-    QueueVisibilityTimeout=900 FrontendOrigin=http://localhost:5173
+    QueueVisibilityTimeout=900 FrontendOrigin=https://dfw9n3vcykvho.cloudfront.net
 ```
 
 Para cada versión posterior de la imagen, usa un tag nuevo, súbelo a ECR y pasa ese valor como `DocumentProcessorImageTag` en el despliegue para registrar una nueva revisión de Task Definition. Luego revisa Outputs y estado ECS:

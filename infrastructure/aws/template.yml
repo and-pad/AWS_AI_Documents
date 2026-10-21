@@ -28,15 +28,27 @@ Parameters:
 
   OllamaReadTimeout:
     Type: Number
-    Default: 1200
+    Default: 1800
     MinValue: 60
-    Description: Read timeout in seconds for one page request from Fargate to Ollama.
+    Description: Read timeout in seconds for one Fargate request to Ollama; this is per generation, not per document.
 
   OllamaNumCtx:
     Type: Number
     Default: 16384
     MinValue: 4096
     Description: Ollama context per request; must fit the rendered image and thinking pass without truncation.
+
+  OllamaPageNumPredict:
+    Type: Number
+    Default: 6000
+    MinValue: 1
+    Description: Maximum generated tokens for one page extraction request.
+
+  OllamaSynthesisNumPredict:
+    Type: Number
+    Default: 2000
+    MinValue: 1
+    Description: Maximum generated tokens for final document synthesis.
 
   DocumentProcessorUrl:
     Type: String
@@ -72,7 +84,7 @@ Parameters:
     AllowedValues:
       - 'false'
       - 'true'
-    Description: Temporarily log bounded raw Ollama output fragments after structured-output validation failures.
+    Description: Temporarily log the exact Ollama message.content after structured-output validation failures. Contains document data; keep false except during a controlled diagnosis.
 
   DocumentProcessorImageTag:
     Type: String
@@ -86,6 +98,13 @@ Parameters:
     MaxValue: 2
     Description: Start at zero until the image is pushed to ECR, then update to one.
 
+  ProcessorMaxConcurrentJobs:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 2
+    Description: Maximum SQS messages processed concurrently inside each Fargate task; set to 2 after validating Ollama capacity.
+
   VpcCidr:
     Type: String
     Default: 10.40.0.0/16
@@ -96,8 +115,8 @@ Parameters:
 
   FrontendOrigin:
     Type: String
-    Default: http://localhost:5173
-    Description: Browser origin allowed to upload and query jobs.
+    Default: https://dfw9n3vcykvho.cloudfront.net
+    Description: Browser origin allowed to upload documents and call the jobs API.
 
   MaxUploadBytes:
     Type: Number

@@ -3,12 +3,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from app.document_service import process_pdf
 from app.ollama_client import OllamaError
 from app.settings import get_settings
 from app.sqs_worker import SqsDocumentWorker
+from app.diagnostics import log_event
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,9 +18,9 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Uvicorn is intentionally started without --workers. This creates exactly
-    # one long-poll consumer per ECS task while the API event loop stays free
-    # for health checks and local diagnostic requests.
+    # Uvicorn is intentionally started without --workers. SqsDocumentWorker
+    # creates the configured number (one or two) of dedicated long-poll threads
+    # while the API event loop stays free for health and local diagnostics.
     worker = SqsDocumentWorker()
     worker.start()
     app.state.sqs_worker = worker
@@ -39,7 +41,13 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    # Keep the health endpoint independent of document/Ollama work. A consumer
+    # thread remains alive while blocked in a long inference, while an
+    # unexpectedly terminated consumer makes ECS replace the task.
+    worker = getattr(app.state, "sqs_worker", None)
+    snapshot = worker.health_snapshot if worker is not None else {"status": "ok"}
+    status_code = 200 if snapshot.get("status") == "ok" else 503
+    return JSONResponse(snapshot, status_code=status_code)
 
 
 @app.post("/process")
@@ -56,8 +64,16 @@ async def process_document(file: UploadFile = File(...), user_prompt: str | None
         return await run_in_threadpool(process_pdf, file.filename or "document.pdf", contents, user_prompt, None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except OllamaError:
-        logger.error("Falló Ollama para filename=%s", file.filename)
+    except OllamaError as exc:
+        log_event(
+            logger,
+            "HTTP_PROCESS_FAILED",
+            level=logging.ERROR,
+            processing_stage="http_process",
+            error_category=exc.category,
+            error_type=type(exc).__name__,
+            http_status=exc.status_code,
+        )
         raise HTTPException(status_code=502, detail="El proveedor de análisis documental no está disponible") from None
     finally:
         contents = b""

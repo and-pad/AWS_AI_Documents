@@ -13,6 +13,17 @@
             UserPoolArn: !GetAtt UserPool.Arn
             Identity:
               Header: Authorization
+        AddDefaultAuthorizerToCorsPreflight: false
+      GatewayResponses:
+        DEFAULT_4XX: &CorsGatewayResponse
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'${FrontendOrigin}'"
+              Access-Control-Allow-Methods: "'GET,POST,DELETE,OPTIONS'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        DEFAULT_5XX: *CorsGatewayResponse
+        UNAUTHORIZED: *CorsGatewayResponse
+        ACCESS_DENIED: *CorsGatewayResponse
 
   DocumentProcessorFunction:
     Type: AWS::Serverless::Function
@@ -115,6 +126,11 @@
               Action:
                 - s3:ListBucket
               Resource: !GetAtt ResultsBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - results/*
+                    - checkpoints/*
         - Statement:
             - Effect: Allow
               Action:
@@ -161,6 +177,10 @@
               Action:
                 - s3:DeleteObject
               Resource: !Sub "${ResultsBucket.Arn}/results/*"
+            - Effect: Allow
+              Action:
+                - s3:DeleteObject
+              Resource: !Sub "${ResultsBucket.Arn}/checkpoints/*"
         - Statement:
             - Effect: Allow
               Action:

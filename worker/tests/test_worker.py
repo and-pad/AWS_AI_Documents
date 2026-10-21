@@ -172,14 +172,17 @@ def test_retry_after_result_put_overwrites_same_deterministic_key(monkeypatch):
     assert s3.deleted == [{"Bucket": "documents", "Key": key}]
 
 
-def test_documents_lifecycle_is_temporary_and_results_bucket_has_no_short_lifecycle():
+def test_documents_and_checkpoints_have_temporary_lifecycle_but_results_do_not():
     storage = Path(__file__).parents[2].joinpath("infrastructure/aws/stacks/storage.yml").read_text()
     documents_bucket = storage.split("  DocumentsBucket:\n", 1)[1].split("\n  ResultsBucket:", 1)[0]
     results_bucket = storage.split("  ResultsBucket:\n", 1)[1].split("\n  JobsTable:", 1)[0]
 
     assert "LifecycleConfiguration:" in documents_bucket
     assert "ExpirationInDays: 30" in documents_bucket
-    assert "LifecycleConfiguration:" not in results_bucket
+    assert "LifecycleConfiguration:" in results_bucket
+    assert "Prefix: checkpoints/" in results_bucket
+    assert "ExpirationInDays: 30" in results_bucket
+    assert "Prefix: results/" not in results_bucket
 
 
 def test_worker_keeps_legacy_key_job_id_parsing():

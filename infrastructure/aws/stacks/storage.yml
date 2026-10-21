@@ -44,6 +44,12 @@
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireTemporaryPageCheckpointsAfter30Days
+            Status: Enabled
+            Prefix: checkpoints/
+            ExpirationInDays: 30
       Tags:
         - Key: Environment
           Value: !Ref Environment

@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
@@ -162,6 +163,27 @@ def _delete_s3_object(bucket: str, key: str) -> None:
             raise
 
 
+def _delete_s3_prefix(bucket: str, prefix: str) -> int:
+    """Delete known job-scoped temporary objects without listing other prefixes."""
+    if not re.fullmatch(r"checkpoints/[A-Za-z0-9_-]{1,100}/", prefix):
+        raise ValueError("Invalid job checkpoint prefix")
+    keys = []
+    request = {"Bucket": bucket, "Prefix": prefix}
+    while True:
+        response = s3.list_objects_v2(**request)
+        for item in response.get("Contents", []):
+            key = item.get("Key")
+            if key and key.startswith(prefix):
+                keys.append(key)
+        token = response.get("NextContinuationToken")
+        if not response.get("IsTruncated") or not token:
+            break
+        request["ContinuationToken"] = token
+    for key in keys:
+        _delete_s3_object(bucket, key)
+    return len(keys)
+
+
 def _delete_job_transaction(table, job_id: str, user_id: str) -> None:
     _transact_write_items([
         {
@@ -192,7 +214,7 @@ def _response(status: int, body: dict) -> dict:
         "headers": {
             "Content-Type": "application/json",
             "Access-Control-Allow-Origin": os.getenv("CORS_ORIGIN", "http://localhost:5173"),
-            "Access-Control-Allow-Headers": "content-type,authorization",
+            "Access-Control-Allow-Headers": "Content-Type,Authorization",
             "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
         },
         "body": json.dumps(body, ensure_ascii=False, default=_json_default),
@@ -319,6 +341,11 @@ def get_job(event: dict, user_id: str) -> dict:
         item.pop("object_key", None)
         item.pop("expires_at", None)
         item.pop("user_id", None)
+        for internal_field in (
+            "processing_owner", "processing_message_id", "processing_lease_until", "processing_attempt",
+            "checkpoint_manifest_key",
+        ):
+            item.pop(internal_field, None)
         result_key = item.pop("result_key", None)
         if result_key:
             try:
@@ -395,6 +422,10 @@ def delete_job(event: dict, user_id: str) -> dict:
     try:
         if result_key:
             _delete_s3_object(os.environ["RESULTS_BUCKET"], result_key)
+        deleted_checkpoints = _delete_s3_prefix(
+            os.environ["RESULTS_BUCKET"], f"checkpoints/{job_id}/"
+        )
+        logger.info("Deleted job checkpoints job_id=%s count=%s", job_id, deleted_checkpoints)
         if object_key:
             _delete_s3_object(os.environ["DOCUMENTS_BUCKET"], object_key)
         try:

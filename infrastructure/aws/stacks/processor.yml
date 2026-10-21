@@ -94,6 +94,18 @@
                 Resource: !Sub "${ResultsBucket.Arn}/results/*"
               - Effect: Allow
                 Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${ResultsBucket.Arn}/checkpoints/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ResultsBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: checkpoints/*
+              - Effect: Allow
+                Action:
                   - dynamodb:GetItem
                   - dynamodb:UpdateItem
                 Resource: !GetAtt JobsTable.Arn
@@ -156,10 +168,16 @@
               Value: !Ref SqsVisibilityHeartbeatSeconds
             - Name: SQS_MAX_RECEIVE_COUNT
               Value: '3'
+            - Name: PROCESSOR_MAX_CONCURRENT_JOBS
+              Value: !Ref ProcessorMaxConcurrentJobs
             - Name: OLLAMA_READ_TIMEOUT
               Value: !Ref OllamaReadTimeout
             - Name: OLLAMA_NUM_CTX
               Value: !Ref OllamaNumCtx
+            - Name: OLLAMA_PAGE_NUM_PREDICT
+              Value: !Ref OllamaPageNumPredict
+            - Name: OLLAMA_SYNTHESIS_NUM_PREDICT
+              Value: !Ref OllamaSynthesisNumPredict
           Secrets:
             - Name: OLLAMA_API_TOKEN
               ValueFrom: !Ref OllamaApiTokenSecret
@@ -183,7 +201,7 @@
     Condition: DeployProcessorOnFargate
     Properties:
       LogGroupName: !Sub "/ecs/${AWS::StackName}-${Environment}-document-processor"
-      RetentionInDays: 14
+      RetentionInDays: 7
 
   ProcessorService:
     Type: AWS::ECS::Service

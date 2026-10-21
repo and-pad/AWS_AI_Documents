@@ -12,6 +12,7 @@ class MemoryS3:
     def __init__(self):
         self.objects = set()
         self.deleted = []
+        self.listed_prefixes = []
 
     def generate_presigned_url(self, *_args, **_kwargs):
         return "https://upload.example.test"
@@ -20,6 +21,11 @@ class MemoryS3:
         self.deleted.append((Bucket, Key))
         self.objects.discard((Bucket, Key))
         return {}
+
+    def list_objects_v2(self, *, Bucket, Prefix, **_kwargs):
+        self.listed_prefixes.append((Bucket, Prefix))
+        keys = [key for bucket, key in self.objects if bucket == Bucket and key.startswith(Prefix)]
+        return {"Contents": [{"Key": key} for key in keys], "IsTruncated": False}
 
 
 class MemoryTable:
@@ -213,6 +219,24 @@ def test_delete_removes_results_input_and_job_then_releases_quota(monkeypatch):
     assert json.loads(listing["body"])["count"] == 0
 
 
+def test_delete_also_removes_only_job_checkpoint_prefix(monkeypatch):
+    item = old_job("job-checkpoints", result_key="results/job-checkpoints.json")
+    table = MemoryTable([item])
+    s3 = setup(monkeypatch, table)
+    s3.objects.update({
+        ("results", "results/job-checkpoints.json"),
+        ("results", "checkpoints/job-checkpoints/page-0001/owner-a.json"),
+        ("results", "checkpoints/job-other/page-0001/owner-b.json"),
+    })
+
+    response = jobs.lambda_handler(request("DELETE", "/jobs/{job_id}", job_id=item["job_id"]), None)
+
+    assert response["statusCode"] == 200
+    assert ("results", "checkpoints/job-checkpoints/page-0001/owner-a.json") in s3.deleted
+    assert ("results", "checkpoints/job-other/page-0001/owner-b.json") not in s3.deleted
+    assert s3.listed_prefixes == [("results", "checkpoints/job-checkpoints/")]
+
+
 def test_user_cannot_delete_another_users_job_or_s3_objects(monkeypatch):
     item = old_job("job-owned-by-b", user_id="user-b", result_key="results/job-owned-by-b.json")
     table = MemoryTable([item])
@@ -223,6 +247,28 @@ def test_user_cannot_delete_another_users_job_or_s3_objects(monkeypatch):
     assert response["statusCode"] == 404
     assert not s3.deleted
     assert item["job_id"] in table.jobs
+
+
+def test_internal_processing_lease_fields_are_not_returned_by_get_job(monkeypatch):
+    item = old_job("job-internal-fields")
+    item.update({
+        "processing_owner": "opaque-owner-token",
+        "processing_message_id": "sqs-message",
+        "processing_lease_until": "2026-10-20T00:00:00Z",
+        "processing_attempt": 2,
+        "checkpoint_manifest_key": "checkpoints/job-internal-fields/manifest/owner.json",
+    })
+    table = MemoryTable([item])
+    setup(monkeypatch, table)
+
+    response = jobs.lambda_handler(request("GET", "/jobs/{job_id}", job_id=item["job_id"]), None)
+
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert not {
+        "processing_owner", "processing_message_id", "processing_lease_until", "processing_attempt",
+        "checkpoint_manifest_key",
+    }.intersection(body)
 
 
 def test_processing_job_cannot_be_deleted(monkeypatch):
