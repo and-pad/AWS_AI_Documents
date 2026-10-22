@@ -41,7 +41,6 @@ function App() {
   const [authMessage, setAuthMessage] = useState('')
   const [authError, setAuthError] = useState('')
   const [file, setFile] = useState<File | null>(null)
-  const [prompt, setPrompt] = useState('')
   const [jobs, setJobs] = useState<Job[]>([])
   const [jobCount, setJobCount] = useState<number | null>(null)
   const [jobLimit, setJobLimit] = useState(20)
@@ -238,7 +237,6 @@ function App() {
     event.preventDefault()
     setError('')
     const selectedFile = file
-    const selectedPrompt = prompt
     if (!apiBase) {
       setError('Configura VITE_API_BASE_URL en frontend/.env.local con la URL de JobsApi.')
       return
@@ -258,7 +256,7 @@ function App() {
       const createdResponse = await fetch(`${apiBase}/jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: token },
-        body: JSON.stringify({ filename: selectedFile.name, content_type: selectedFile.type || 'application/pdf', file_size: selectedFile.size, user_prompt: selectedPrompt }),
+        body: JSON.stringify({ filename: selectedFile.name, content_type: selectedFile.type || 'application/pdf', file_size: selectedFile.size }),
       })
       if (!createdResponse.ok) throw new Error(await responseError(createdResponse))
       const created: CreatedJob = await createdResponse.json()
@@ -323,15 +321,6 @@ function App() {
         />
         {file && <p className="file-info">{file.name} · {formatBytes(file.size)}</p>}
 
-        <label htmlFor="prompt">Instrucción opcional</label>
-        <textarea
-          id="prompt"
-          rows={3}
-          maxLength={4000}
-          placeholder="Por ejemplo: identifica todas las cantidades económicas."
-          value={prompt}
-          onChange={(event) => setPrompt(event.target.value)}
-        />
         <button type="submit" disabled={uploading || !file}>{uploading ? 'Subiendo…' : 'Cargar y analizar'}</button>
         {error && <p className="error" role="alert">{error}</p>}
       </form>
@@ -359,7 +348,7 @@ function App() {
           {job.deleteError && <p className="error" role="alert">{job.deleteError}</p>}
           {job.pollError && <p className="error" role="alert">Error consultando el estado: {job.pollError}. Se volverá a intentar.</p>}
           {job.result_unavailable && <p className="file-info" role="status">{job.result_message || 'El resultado almacenado ya no está disponible.'}</p>}
-          {job.result && <ResultView result={job.result} status={job.status} />}
+          {job.result && <ResultView result={job.result} status={job.status} jobId={job.job_id} askDisabled={deletingJobs.has(job.job_id)} />}
         </section>
       ))}
       </>}

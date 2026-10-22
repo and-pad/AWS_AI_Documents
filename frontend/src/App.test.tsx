@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const authMocks = vi.hoisted(() => ({
@@ -151,6 +151,7 @@ describe('job history restoration', () => {
 
     render(<App />)
     expect(await screen.findByText('20 / 20 documentos')).toBeTruthy()
+    expect(screen.queryByLabelText('Instrucción opcional')).toBeNull()
     fireEvent.change(screen.getByLabelText('Documento PDF'), {
       target: { files: [new File(['pdf'], 'twenty-first.pdf', { type: 'application/pdf' })] },
     })
@@ -158,6 +159,8 @@ describe('job history restoration', () => {
 
     expect(await screen.findByText('Has alcanzado el límite de 20 documentos. Elimina uno para continuar.')).toBeTruthy()
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT')).toBe(false)
+    const createCall = fetchMock.mock.calls.find(([, init]) => init?.method === 'POST')
+    expect(JSON.parse(String((createCall?.[1] as RequestInit).body))).not.toHaveProperty('user_prompt')
   })
 
   it('renders structured result sections with independent expansion and text-only content', async () => {
@@ -267,5 +270,225 @@ describe('job history restoration', () => {
     render(<App />)
     expect(await screen.findByText('Procesando documento · Página 2 de 3 · 66%')).toBeTruthy()
     expect(screen.getByLabelText('Progreso del procesamiento')).toBeTruthy()
+  })
+
+  it('asks the API using the owning card job id and keeps answers isolated between documents', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/jobs') && !init?.method) {
+        return jsonResponse({ jobs: [
+          { job_id: 'document-a', status: 'COMPLETED', filename: 'a.pdf' },
+          { job_id: 'document-b', status: 'COMPLETED', filename: 'b.pdf' },
+        ], count: 2, limit: 20 })
+      }
+      if (url.endsWith('/jobs/document-a/ask')) return jsonResponse({ job_id: 'document-a', ask_id: 'ask-a', status: 'PENDING' }, 202)
+      if (url.endsWith('/jobs/document-a/asks/ask-a')) return jsonResponse({
+        job_id: 'document-a', ask_id: 'ask-a', status: 'COMPLETED', answer: 'Respuesta exclusiva de A', source_pages: [2],
+      })
+      const jobId = url.endsWith('/jobs/document-a') ? 'document-a' : 'document-b'
+      return jsonResponse({
+        job_id: jobId,
+        status: 'COMPLETED',
+        filename: `${jobId}.pdf`,
+        result: {
+          filename: `${jobId}.pdf`, pages: 1,
+          analysis: { document_type: 'Contrato', summary: `Resumen ${jobId}`, key_points: [] },
+          transcription: { text: 'Documento sintético.' },
+          visual_elements: { stamps: [], signatures: [], other_marks: [] },
+          requested_output: { user_request: '', response: null },
+        },
+      })
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const cardA = screen.getByText('ID: document-a').closest('section') as HTMLElement
+    const cardB = screen.getByText('ID: document-b').closest('section') as HTMLElement
+    const askAccordionA = within(cardA).getByRole('button', { name: /Preguntar a la IA/ })
+    fireEvent.click(askAccordionA)
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(cardA).getByLabelText('Tu pregunta'), { target: { value: '¿Quién firmó el documento?' } })
+    fireEvent.click(within(cardA).getByRole('button', { name: 'Preguntar' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    expect(fetchMock.mock.calls.some(([input, init]) =>
+      String(input).endsWith('/jobs/document-a/ask')
+      && init?.method === 'POST'
+      && JSON.parse(String(init.body)).question === '¿Quién firmó el documento?',
+    )).toBe(true)
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/jobs/document-b/ask'))).toBe(false)
+    expect(within(cardA).getByText('Respuesta exclusiva de A')).toBeTruthy()
+    expect(within(cardB).queryByText('Respuesta exclusiva de A')).toBeNull()
+    expect(within(cardA).getByText('Página 2')).toBeTruthy()
+  })
+
+  it('cancels question status polling when the document view unmounts', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input) => String(input).endsWith('/jobs')
+      ? jsonResponse({ jobs: [{ job_id: 'pending-ask', status: 'COMPLETED', filename: 'a.pdf' }], count: 1, limit: 20 })
+      : String(input).endsWith('/jobs/pending-ask/ask')
+        ? jsonResponse({ job_id: 'pending-ask', ask_id: 'ask-pending', status: 'PENDING' }, 202)
+        : String(input).endsWith('/jobs/pending-ask/asks/ask-pending')
+          ? jsonResponse({ job_id: 'pending-ask', ask_id: 'ask-pending', status: 'PROCESSING' })
+          : jsonResponse({
+            job_id: 'pending-ask', status: 'COMPLETED', filename: 'a.pdf',
+            result: {
+              filename: 'a.pdf', pages: 1,
+              analysis: { document_type: 'Carta', summary: 'Resumen', key_points: [] },
+              transcription: { text: 'Texto' },
+              visual_elements: { stamps: [], signatures: [], other_marks: [] },
+              requested_output: { user_request: '', response: null },
+            },
+          }))
+
+    const view = render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const card = screen.getByText('ID: pending-ask').closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: /Preguntar a la IA/ }))
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(card).getByLabelText('Tu pregunta'), { target: { value: '¿Qué dice?' } })
+    fireEvent.click(within(card).getByRole('button', { name: 'Preguntar' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+    view.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps a pending backend ask pending after the local polling window and allows resuming', async () => {
+    vi.useFakeTimers()
+    let now = 1_000_000
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    let statusReads = 0
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/jobs')) return jsonResponse({ jobs: [
+        { job_id: 'slow-job', status: 'COMPLETED', filename: 'slow.pdf' },
+      ], count: 1, limit: 20 })
+      if (url.endsWith('/jobs/slow-job/ask')) return jsonResponse({
+        job_id: 'slow-job', ask_id: 'ask-slow', status: 'PENDING',
+      }, 202)
+      if (url.endsWith('/jobs/slow-job/asks/ask-slow')) {
+        statusReads += 1
+        if (statusReads === 1) {
+          now += 20 * 60 * 1000 + 1
+          return jsonResponse({ job_id: 'slow-job', ask_id: 'ask-slow', status: 'PROCESSING' })
+        }
+        return jsonResponse({
+          job_id: 'slow-job', ask_id: 'ask-slow', status: 'COMPLETED',
+          answer: 'Respuesta tardía', source_pages: [1],
+        })
+      }
+      return jsonResponse({
+        job_id: 'slow-job', status: 'COMPLETED', filename: 'slow.pdf',
+        result: {
+          filename: 'slow.pdf', pages: 1,
+          analysis: { document_type: 'Carta', summary: 'Resumen', key_points: [] },
+          transcription: { text: 'Texto' },
+          visual_elements: { stamps: [], signatures: [], other_marks: [] },
+          requested_output: { user_request: '', response: null },
+        },
+      })
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const card = screen.getByText('ID: slow-job').closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: /Preguntar a la IA/ }))
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(card).getByLabelText('Tu pregunta'), { target: { value: '¿Qué ocurre?' } })
+    fireEvent.click(within(card).getByRole('button', { name: 'Preguntar' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    expect(within(card).getByText('Buscando en el documento…')).toBeTruthy()
+    expect(within(card).getByText(/Se detuvo la consulta automática/)).toBeTruthy()
+    expect(within(card).queryByText('No se pudo responder la pregunta.')).toBeNull()
+
+    const resumeButton = within(card).getByRole('button', { name: 'Revisar estado' })
+    act(() => {
+      resumeButton.click()
+      resumeButton.click()
+    })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(within(card).getByText('Respuesta tardía')).toBeTruthy()
+    expect(statusReads).toBe(2)
+  })
+
+  it('shows a question quota error without creating a fake failed ask', async () => {
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith('/jobs')) return jsonResponse({
+        jobs: [{ job_id: 'quota-job', status: 'COMPLETED', filename: 'quota.pdf' }], count: 1, limit: 20,
+      })
+      if (String(input).endsWith('/jobs/quota-job/ask')) return jsonResponse({
+        error: 'Alcanzaste el límite diario de preguntas sobre documentos.',
+      }, 429)
+      return jsonResponse({
+        job_id: 'quota-job', status: 'COMPLETED', filename: 'quota.pdf',
+        result: {
+          filename: 'quota.pdf', pages: 1,
+          analysis: { document_type: 'Carta', summary: 'Resumen', key_points: [] },
+          transcription: { text: 'Texto' },
+          visual_elements: { stamps: [], signatures: [], other_marks: [] },
+          requested_output: { user_request: '', response: null },
+        },
+      })
+    })
+    render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const card = screen.getByText('ID: quota-job').closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: /Preguntar a la IA/ }))
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(card).getByLabelText('Tu pregunta'), { target: { value: '¿Una pregunta?' } })
+    fireEvent.click(within(card).getByRole('button', { name: 'Preguntar' }))
+    expect(await within(card).findByText('Alcanzaste el límite diario de preguntas sobre documentos.')).toBeTruthy()
+    expect(within(card).queryByText('No se pudo responder la pregunta.')).toBeNull()
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/asks/'))).toBe(false)
+  })
+
+  it('stops polling when an ask has expired or is no longer accessible', async () => {
+    vi.useFakeTimers()
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input)
+      if (url.endsWith('/jobs')) return jsonResponse({
+        jobs: [{ job_id: 'expired-job', status: 'COMPLETED', filename: 'expired.pdf' }], count: 1, limit: 20,
+      })
+      if (url.endsWith('/jobs/expired-job/ask')) return jsonResponse({
+        job_id: 'expired-job', ask_id: 'ask-expired', status: 'PENDING',
+      }, 202)
+      if (url.endsWith('/jobs/expired-job/asks/ask-expired')) return jsonResponse({ error: 'Consulta no encontrada' }, 404)
+      return jsonResponse({
+        job_id: 'expired-job', status: 'COMPLETED', filename: 'expired.pdf',
+        result: {
+          filename: 'expired.pdf', pages: 1,
+          analysis: { document_type: 'Carta', summary: 'Resumen', key_points: [] },
+          transcription: { text: 'Texto' },
+          visual_elements: { stamps: [], signatures: [], other_marks: [] },
+          requested_output: { user_request: '', response: null },
+        },
+      })
+    })
+    render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const card = screen.getByText('ID: expired-job').closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: /Preguntar a la IA/ }))
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(card).getByLabelText('Tu pregunta'), { target: { value: '¿Qué fecha?' } })
+    fireEvent.click(within(card).getByRole('button', { name: 'Preguntar' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    expect(within(card).getByText(/La consulta ya no está disponible/)).toBeTruthy()
+    expect(within(card).queryByRole('button', { name: 'Revisar estado' })).toBeNull()
   })
 })

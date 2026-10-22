@@ -50,6 +50,44 @@ Parameters:
     MinValue: 1
     Description: Maximum generated tokens for final document synthesis.
 
+  OllamaAskNumPredict:
+    Type: Number
+    Default: 1000
+    MinValue: 1
+    Description: Maximum generated tokens for one answer to a question about a completed document.
+
+  OllamaAskReadTimeout:
+    Type: Number
+    Default: 780
+    MinValue: 10
+    MaxValue: 780
+    Description: Read timeout per question; the worker shortens it to retain at least 90 seconds for persistence and SQS response.
+
+  OllamaAskContextMaxChars:
+    Type: Number
+    Default: 16000
+    MinValue: 1000
+    Description: Maximum selected document evidence characters sent to one question request.
+
+  QuestionQueueVisibilityTimeout:
+    Type: Number
+    Default: 5400
+    MinValue: 5400
+    Description: Question queue visibility; six times the 900-second question worker timeout.
+
+  QuestionRetryDelaySeconds:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 300
+    Description: Per-message retry delay base for handled transient question failures; the queue visibility remains unchanged.
+
+  MaxUserQuestionsPerDay:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: Daily question submission limit per authenticated Cognito user.
+
   DocumentProcessorUrl:
     Type: String
     Default: http://document-processor:8000/process

@@ -56,6 +56,32 @@
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
+  # Questions use a separate queue so they can never be interpreted as S3
+  # document-created notifications by the existing Fargate consumer.
+  QuestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: !Ref QuestionQueueVisibilityTimeout
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt QuestionDeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
+  QuestionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 180
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline
+
 
   # ============================================================
   # Lambda Worker

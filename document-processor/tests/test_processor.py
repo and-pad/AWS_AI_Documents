@@ -489,6 +489,12 @@ def test_one_page_and_empty_prompt(monkeypatch):
     monkeypatch.setattr("app.document_service.OllamaClient", lambda: fake)
     result = process_pdf("one.pdf", make_pdf(), "", None)
     assert result["pages"] == 1
+    assert result["page_extractions"] == [{
+        "page": 1,
+        "transcription": "Encabezado 1\nLínea literal 1",
+        "analysis_notes": "Análisis 1",
+        "visual_elements": {"stamps": [], "signatures": [], "other_marks": []},
+    }]
     assert result["analysis"]["document_type"] == "Documento de prueba"
     assert result["transcription"]["text"] == "--- Página 1 ---\nEncabezado 1\nLínea literal 1"
     assert result["visual_elements"] == {"stamps": [], "signatures": [], "other_marks": []}
@@ -504,6 +510,8 @@ def test_multipage_sequential_context_and_prompt(monkeypatch):
     monkeypatch.setattr("app.document_service.OllamaClient", lambda: fake)
     result = process_pdf("many.pdf", make_pdf(3), "Identifica cantidades", None)
     assert result["pages"] == 3
+    assert [item["page"] for item in result["page_extractions"]] == [1, 2, 3]
+    assert result["page_extractions"][2]["transcription"] == "Encabezado 3\nLínea literal 3"
     assert result["transcription"]["text"] == (
         "--- Página 1 ---\nEncabezado 1\nLínea literal 1\n\n"
         "--- Página 2 ---\nEncabezado 2\nLínea literal 2\n\n"

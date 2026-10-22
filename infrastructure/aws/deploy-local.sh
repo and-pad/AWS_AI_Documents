@@ -24,6 +24,7 @@ lstk sam deploy \
     ProcessorDeployment=local \
     QueueVisibilityTimeout=900 \
     FrontendOrigin=http://localhost:5173 \
+    "OllamaBaseUrl=http://${host_gateway}:11434" \
     "DocumentProcessorUrl=http://${host_gateway}:8000/process"
 
 # LocalStack's SAM deploy left the template's ReservedConcurrentExecutions

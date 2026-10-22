@@ -101,3 +101,51 @@ def test_delete_transaction_sends_negative_number_with_nonnegative_guard(monkeyp
     assert quota_update["ExpressionAttributeValues"][":decrement"] == {"N": "-1"}
     assert quota_update["ExpressionAttributeValues"][":zero"] == {"N": "0"}
     assert quota_update["ConditionExpression"] == "#count > :zero"
+
+
+def test_create_ask_transaction_checks_owner_status_and_rate_limit_on_wire(monkeypatch):
+    resource = boto3.resource(
+        "dynamodb",
+        region_name="us-east-2",
+        aws_access_key_id="unit-test-access-key",
+        aws_secret_access_key="unit-test-secret-key",
+    )
+    requests = []
+
+    def capture(request, **_kwargs):
+        requests.append(json.loads(request.body))
+        return AWSResponse(
+            request.url,
+            200,
+            {"content-type": "application/x-amz-json-1.0"},
+            FakeResponseBody(),
+        )
+
+    resource.meta.client.meta.events.register("before-send.dynamodb.TransactWriteItems", capture)
+    monkeypatch.setattr(jobs, "ddb", resource)
+    monkeypatch.setattr(jobs, "_table", lambda: type("Table", (), {"name": "jobs-table"})())
+    monkeypatch.setattr(jobs, "_question_table", lambda: type("Table", (), {"name": "question-table"})())
+
+    jobs._transact_create_ask(
+        "job-1",
+        "cognito-sub",
+        {"job_id": "job-1", "ask_id": "ask-1", "user_id": "cognito-sub", "question": "¿Fecha?", "expires_at": 1},
+        {"job_id": "__user_question_rate__#cognito-sub#2026-10-21", "ask_id": "__counter__"},
+    )
+
+    operations = requests[0]["TransactItems"]
+    ownership_check = operations[0]["ConditionCheck"]
+    assert ownership_check["TableName"] == "jobs-table"
+    assert ownership_check["Key"] == {"job_id": {"S": "job-1"}}
+    assert ownership_check["ConditionExpression"] == "user_id = :owner AND #status = :completed"
+
+    rate_update = operations[1]["Update"]
+    assert rate_update["TableName"] == "question-table"
+    assert rate_update["ExpressionAttributeValues"][":one"] == {"N": "1"}
+    assert rate_update["ExpressionAttributeValues"][":limit"] == {"N": "50"}
+    assert "attribute_not_exists(#count)" in rate_update["ConditionExpression"]
+
+    ask_put = operations[2]["Put"]
+    assert ask_put["Item"]["question"] == {"S": "¿Fecha?"}
+    assert ask_put["Item"]["user_id"] == {"S": "cognito-sub"}
+    assert ask_put["Item"]["expires_at"] == {"N": "1"}

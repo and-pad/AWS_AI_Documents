@@ -92,3 +92,28 @@
           Value: !Ref Environment
         - Key: Project
           Value: document-ai-pipeline
+
+  # Short-lived, job-scoped question state. It contains user questions and
+  # answers for at most one day; DELETE /jobs removes the job partition sooner.
+  QuestionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: ask_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+        - AttributeName: ask_id
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: document-ai-pipeline

@@ -115,6 +115,10 @@
           CORS_ORIGIN: !Ref FrontendOrigin
           MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
           MAX_USER_JOBS: !Ref MaxUserJobs
+          QUESTION_TABLE: !Ref QuestionTable
+          QUESTION_QUEUE_URL: !Ref QuestionQueue
+          QUESTION_STALE_AFTER_SECONDS: '32400'
+          MAX_USER_QUESTIONS_PER_DAY: !Ref MaxUserQuestionsPerDay
       Policies:
         - Statement:
             - Effect: Allow
@@ -144,6 +148,19 @@
               Action:
                 - dynamodb:Query
               Resource: !Sub "${JobsTable.Arn}/index/UserJobsIndex"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt QuestionTable.Arn
+        - Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt QuestionQueue.Arn
         - Statement:
             - Effect: Allow
               Action:
@@ -219,3 +236,175 @@
             Method: DELETE
             Auth:
               Authorizer: CognitoAuthorizer
+        AskDocumentQuestion:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{job_id}/ask
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+        GetDocumentQuestion:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JobsApi
+            Path: /jobs/{job_id}/asks/{ask_id}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  QuestionProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessDocumentQuestions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt QuestionQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !GetAtt JobsTable.Arn
+                  - !GetAtt QuestionTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${ResultsBucket.Arn}/results/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${QuestionProcessorLogGroup.Arn}:*"
+
+  QuestionProcessorOllamaSecretPolicy:
+    Type: AWS::IAM::Policy
+    Condition: DeployProcessorOnFargate
+    Properties:
+      PolicyName: ReadOllamaTokenForDocumentQuestions
+      Roles:
+        - !Ref QuestionProcessorRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref OllamaApiTokenSecret
+
+  QuestionProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-${Environment}-document-question-worker"
+      RetentionInDays: 7
+
+  QuestionProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Environment}-document-question-worker"
+      CodeUri: ../../worker/
+      Handler: app.question_worker.lambda_handler
+      Role: !GetAtt QuestionProcessorRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          QUESTION_TABLE: !Ref QuestionTable
+          QUESTION_QUEUE_URL: !Ref QuestionQueue
+          RESULTS_BUCKET: !Ref ResultsBucket
+          OLLAMA_BASE_URL: !Ref OllamaBaseUrl
+          OLLAMA_MODEL: !Ref OllamaModel
+          OLLAMA_NUM_CTX: !Ref OllamaNumCtx
+          OLLAMA_ASK_NUM_PREDICT: !Ref OllamaAskNumPredict
+          OLLAMA_ASK_READ_TIMEOUT: !Ref OllamaAskReadTimeout
+          OLLAMA_ASK_CONTEXT_MAX_CHARS: !Ref OllamaAskContextMaxChars
+          OLLAMA_API_TOKEN_SECRET_ARN: !If [DeployProcessorOnFargate, !Ref OllamaApiTokenSecret, '']
+          QUESTION_RETRY_DELAY_SECONDS: !Ref QuestionRetryDelaySeconds
+          SQS_MAX_RECEIVE_COUNT: '3'
+          ASK_PROCESSING_LEASE_SECONDS: '960'
+      Events:
+        QuestionQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt QuestionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  QuestionDlqReconcilerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReconcileExhaustedDocumentQuestions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:ChangeMessageVisibility
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt QuestionDeadLetterQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt QuestionTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${QuestionDlqReconcilerLogGroup.Arn}:*"
+
+  QuestionDlqReconcilerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-${Environment}-document-question-dlq-reconciler"
+      RetentionInDays: 7
+
+  QuestionDlqReconcilerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-${Environment}-document-question-dlq-reconciler"
+      CodeUri: ../../worker/
+      Handler: app.question_worker.lambda_dlq_handler
+      Role: !GetAtt QuestionDlqReconcilerRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          QUESTION_TABLE: !Ref QuestionTable
+          QUESTION_DLQ_URL: !Ref QuestionDeadLetterQueue
+      Events:
+        QuestionDeadLetterQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt QuestionDeadLetterQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures

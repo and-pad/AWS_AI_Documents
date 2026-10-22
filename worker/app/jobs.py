@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
@@ -32,8 +33,13 @@ def _create_s3_client():
 
 
 s3 = _create_s3_client()
+sqs = boto3.client("sqs")
 USER_JOBS_PAGE_SIZE = 100
 MAX_USER_JOBS = int(os.getenv("MAX_USER_JOBS", "20"))
+MAX_USER_QUESTIONS_PER_DAY = int(os.getenv("MAX_USER_QUESTIONS_PER_DAY", "50"))
+MAX_QUESTION_LENGTH = 2000
+QUESTION_RECORD_TTL_SECONDS = 86400
+QUESTION_STALE_AFTER_SECONDS = int(os.getenv("QUESTION_STALE_AFTER_SECONDS", "32400"))
 PRESIGNED_URL_TTL_SECONDS = 900
 PRESIGNED_URL_DELETE_GRACE_SECONDS = 300
 QUOTA_JOB_ID_PREFIX = "__user_quota__#"
@@ -57,6 +63,10 @@ PUBLIC_JOB_FIELDS = (
 
 def _table():
     return ddb.Table(os.environ["JOBS_TABLE"])
+
+
+def _question_table():
+    return ddb.Table(os.environ["QUESTION_TABLE"])
 
 
 def _quota_key(user_id: str) -> str:
@@ -184,6 +194,29 @@ def _delete_s3_prefix(bucket: str, prefix: str) -> int:
     return len(keys)
 
 
+def _delete_job_questions(job_id: str, user_id: str) -> int:
+    """Remove all transient question records for this job using its table partition key."""
+    table_name = os.getenv("QUESTION_TABLE")
+    if not table_name:
+        return 0
+    table = ddb.Table(table_name)
+    query = {
+        "KeyConditionExpression": Key("job_id").eq(job_id),
+        "ConsistentRead": True,
+    }
+    deleted = 0
+    while True:
+        response = table.query(**query)
+        for item in response.get("Items", []):
+            if item.get("user_id") == user_id and item.get("ask_id"):
+                table.delete_item(Key={"job_id": job_id, "ask_id": item["ask_id"]})
+                deleted += 1
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return deleted
+        query["ExclusiveStartKey"] = last_key
+
+
 def _delete_job_transaction(table, job_id: str, user_id: str) -> None:
     _transact_write_items([
         {
@@ -239,7 +272,6 @@ def create_job(event: dict, user_id: str) -> dict:
         payload = json.loads(event.get("body") or "{}")
         filename = PurePath(str(payload.get("filename", ""))).name
         content_type = payload.get("content_type", "application/pdf")
-        user_prompt = str(payload.get("user_prompt") or "")[:4000]
         file_size = int(payload.get("file_size", 0))
         max_upload_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
         if not filename or not filename.lower().endswith(".pdf"):
@@ -269,7 +301,6 @@ def create_job(event: dict, user_id: str) -> dict:
             "filename": filename,
             "bucket": bucket,
             "object_key": key,
-            "user_prompt": user_prompt,
             "created_at": _now(),
             "updated_at": _now(),
         }
@@ -341,6 +372,9 @@ def get_job(event: dict, user_id: str) -> dict:
         item.pop("object_key", None)
         item.pop("expires_at", None)
         item.pop("user_id", None)
+        # Retain old prompt fields in stored records for worker compatibility,
+        # but do not expose them through the current public job response.
+        item.pop("user_prompt", None)
         for internal_field in (
             "processing_owner", "processing_message_id", "processing_lease_until", "processing_attempt",
             "checkpoint_manifest_key",
@@ -350,7 +384,12 @@ def get_job(event: dict, user_id: str) -> dict:
         if result_key:
             try:
                 result_object = s3.get_object(Bucket=os.environ["RESULTS_BUCKET"], Key=result_key)
-                item["result"] = json.loads(result_object["Body"].read())
+                stored_result = json.loads(result_object["Body"].read())
+                if isinstance(stored_result, dict):
+                    # Page-scoped evidence is private backend context for /ask;
+                    # the existing UI already receives the assembled transcription.
+                    stored_result.pop("page_extractions", None)
+                item["result"] = stored_result
             except ClientError as exc:
                 error = exc.response.get("Error", {})
                 status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
@@ -363,6 +402,222 @@ def get_job(event: dict, user_id: str) -> dict:
     except Exception:
         logger.exception("No se pudo consultar el trabajo job_id=%s", job_id)
         return _response(500, {"error": "No se pudo consultar el trabajo"})
+
+
+def _ask_rate_key(user_id: str) -> dict:
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return {"job_id": f"__user_question_rate__#{user_id}#{day}", "ask_id": "__counter__"}
+
+
+def _transact_create_ask(job_id: str, user_id: str, ask_item: dict, rate_key: dict) -> None:
+    jobs_table = _table()
+    question_table = _question_table()
+    now = int(time.time())
+    _transact_write_items([
+        {
+            "ConditionCheck": {
+                "TableName": jobs_table.name,
+                "Key": {"job_id": job_id},
+                "ConditionExpression": "user_id = :owner AND #status = :completed",
+                "ExpressionAttributeNames": {"#status": "status"},
+                "ExpressionAttributeValues": {":owner": user_id, ":completed": "COMPLETED"},
+            }
+        },
+        {
+            "Update": {
+                "TableName": question_table.name,
+                "Key": rate_key,
+                "UpdateExpression": "SET expires_at = :expires ADD #count :one",
+                "ConditionExpression": "attribute_not_exists(#count) OR #count < :limit",
+                "ExpressionAttributeNames": {"#count": "question_count"},
+                "ExpressionAttributeValues": {
+                    ":expires": now + QUESTION_RECORD_TTL_SECONDS,
+                    ":one": 1,
+                    ":limit": MAX_USER_QUESTIONS_PER_DAY,
+                },
+            }
+        },
+        {
+            "Put": {
+                "TableName": question_table.name,
+                "Item": ask_item,
+                "ConditionExpression": "attribute_not_exists(job_id) AND attribute_not_exists(ask_id)",
+            }
+        },
+    ])
+
+
+def _question_quota_count(rate_key: dict) -> int:
+    item = _question_table().get_item(Key=rate_key, ConsistentRead=True).get("Item", {})
+    return int(item.get("question_count", 0))
+
+
+def _authorized_completed_job(job_id: str, user_id: str) -> tuple[dict | None, dict | None]:
+    item = _table().get_item(Key={"job_id": job_id}, ConsistentRead=True).get("Item")
+    if not item or item.get("user_id") != user_id:
+        return None, _response(404, {"error": "Trabajo no encontrado"})
+    if item.get("status") != "COMPLETED":
+        if item.get("status") in {"DELETING"}:
+            return None, _response(404, {"error": "Trabajo no encontrado"})
+        return None, _response(409, {"error": "Las preguntas estarán disponibles cuando el análisis termine."})
+    result_key = item.get("result_key")
+    if result_key != f"results/{job_id}.json":
+        return None, _response(409, {"error": "El resultado del documento no está disponible para consultas."})
+    return item, None
+
+
+def create_ask(event: dict, user_id: str) -> dict:
+    job_id = (event.get("pathParameters") or {}).get("job_id", "")
+    if not job_id:
+        return _response(400, {"error": "Falta job_id"})
+    try:
+        payload = json.loads(event.get("body") or "{}")
+    except (TypeError, ValueError):
+        return _response(400, {"error": "El cuerpo debe ser JSON válido"})
+    if not isinstance(payload, dict):
+        return _response(400, {"error": "El cuerpo debe ser un objeto JSON"})
+    question = payload.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return _response(400, {"error": "Escribe una pregunta sobre el documento"})
+    question = question.strip()
+    if len(question) > MAX_QUESTION_LENGTH:
+        return _response(413, {"error": f"La pregunta no puede superar {MAX_QUESTION_LENGTH} caracteres"})
+
+    _, error_response = _authorized_completed_job(job_id, user_id)
+    if error_response:
+        return error_response
+
+    ask_id = str(uuid.uuid4())
+    now = _now()
+    expires_at = int(time.time()) + QUESTION_RECORD_TTL_SECONDS
+    ask_item = {
+        "job_id": job_id,
+        "ask_id": ask_id,
+        "user_id": user_id,
+        "question": question,
+        "status": "PENDING",
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": expires_at,
+    }
+    rate_key = _ask_rate_key(user_id)
+    try:
+        _transact_create_ask(job_id, user_id, ask_item, rate_key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "TransactionCanceledException":
+            if _question_quota_count(rate_key) >= MAX_USER_QUESTIONS_PER_DAY:
+                return _response(429, {"error": "Alcanzaste el límite diario de preguntas sobre documentos."})
+            _, latest_error = _authorized_completed_job(job_id, user_id)
+            if latest_error:
+                return latest_error
+            logger.info("No se pudo crear una consulta por conflicto de estado job_id=%s", job_id)
+            return _response(409, {"error": "No se pudo iniciar la consulta. Inténtalo nuevamente."})
+        logger.exception("No se pudo reservar una consulta job_id=%s", job_id)
+        return _response(500, {"error": "No se pudo iniciar la consulta"})
+    try:
+        sqs.send_message(
+            QueueUrl=os.environ["QUESTION_QUEUE_URL"],
+            MessageBody=json.dumps({"job_id": job_id, "ask_id": ask_id, "user_id": user_id}),
+        )
+    except Exception:
+        try:
+            _question_table().update_item(
+                Key={"job_id": job_id, "ask_id": ask_id},
+                UpdateExpression="SET #status = :failed, error = :error, updated_at = :updated",
+                ConditionExpression="#status = :pending",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":failed": "FAILED", ":pending": "PENDING",
+                    ":error": "No se pudo poner la consulta en cola.", ":updated": _now(),
+                },
+            )
+        except Exception:
+            logger.exception("No se pudo cerrar una consulta que no llegó a SQS job_id=%s ask_id=%s", job_id, ask_id)
+        logger.exception("No se pudo enviar una consulta a SQS job_id=%s ask_id=%s", job_id, ask_id)
+        return _response(503, {"error": "No se pudo iniciar la consulta. Inténtalo nuevamente."})
+    logger.info("ASK_CREATED job_id=%s ask_id=%s status=PENDING", job_id, ask_id)
+    return _response(202, {"job_id": job_id, "ask_id": ask_id, "status": "PENDING"})
+
+
+def get_ask(event: dict, user_id: str) -> dict:
+    path = event.get("pathParameters") or {}
+    job_id, ask_id = path.get("job_id", ""), path.get("ask_id", "")
+    if not job_id or not ask_id:
+        return _response(400, {"error": "Faltan identificadores de la consulta"})
+    _, error_response = _authorized_completed_job(job_id, user_id)
+    if error_response:
+        return error_response
+    try:
+        item = _question_table().get_item(Key={"job_id": job_id, "ask_id": ask_id}, ConsistentRead=True).get("Item")
+        if not item or item.get("user_id") != user_id:
+            return _response(404, {"error": "Consulta no encontrada"})
+        try:
+            if int(item.get("expires_at", 0)) <= int(time.time()):
+                return _response(404, {"error": "Consulta no encontrada"})
+        except (TypeError, ValueError):
+            return _response(404, {"error": "Consulta no encontrada"})
+        # Recheck the parent after reading the answer. DELETE first changes the
+        # job to DELETING, so a poll racing with deletion does not return data.
+        _, latest_error = _authorized_completed_job(job_id, user_id)
+        if latest_error:
+            return latest_error
+        if item.get("status") in {"PENDING", "PROCESSING"} and _ask_is_stale(item):
+            _mark_stale_ask_failed(item, user_id)
+            item = _question_table().get_item(
+                Key={"job_id": job_id, "ask_id": ask_id}, ConsistentRead=True
+            ).get("Item")
+            if not item or item.get("user_id") != user_id:
+                return _response(404, {"error": "Consulta no encontrada"})
+        public_fields = ("job_id", "ask_id", "status", "answer", "source_pages", "context_limited", "created_at", "completed_at", "error")
+        return _response(200, {field: item[field] for field in public_fields if field in item})
+    except Exception:
+        logger.exception("No se pudo consultar el estado de una pregunta job_id=%s ask_id=%s", job_id, ask_id)
+        return _response(500, {"error": "No se pudo consultar la pregunta"})
+
+
+def _ask_is_stale(item: dict) -> bool:
+    timestamp = item.get("updated_at") or item.get("created_at")
+    if not isinstance(timestamp, str):
+        return False
+    try:
+        updated = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - updated).total_seconds() >= QUESTION_STALE_AFTER_SECONDS
+
+
+def _mark_stale_ask_failed(item: dict, user_id: str) -> None:
+    try:
+        _question_table().update_item(
+            Key={"job_id": item["job_id"], "ask_id": item["ask_id"]},
+            UpdateExpression=(
+                "SET #status = :failed, error = :error, error_category = :category, "
+                "failed_at = :now, updated_at = :now "
+                "REMOVE processing_owner, processing_lease_until"
+            ),
+            ConditionExpression=(
+                "user_id = :owner AND expires_at > :epoch AND updated_at = :previous "
+                "AND (#status = :pending OR #status = :processing)"
+            ),
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":failed": "FAILED",
+                ":error": "La consulta excedió el tiempo máximo de recuperación. Puedes intentarlo nuevamente.",
+                ":category": "stale_recovery_timeout",
+                ":now": _now(),
+                ":epoch": int(time.time()),
+                ":previous": item.get("updated_at", item.get("created_at")),
+                ":owner": user_id,
+                ":pending": "PENDING",
+                ":processing": "PROCESSING",
+            },
+        )
+        logger.error("ASK_EXPIRED job_id=%s ask_id=%s outcome=marked_failed", item["job_id"], item["ask_id"])
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            raise
 
 
 def delete_job(event: dict, user_id: str) -> dict:
@@ -420,6 +675,8 @@ def delete_job(event: dict, user_id: str) -> dict:
         return _response(500, {"error": "La clave del documento no es válida para eliminar"})
 
     try:
+        deleted_questions = _delete_job_questions(job_id, user_id)
+        logger.info("Deleted transient document questions job_id=%s count=%s", job_id, deleted_questions)
         if result_key:
             _delete_s3_object(os.environ["RESULTS_BUCKET"], result_key)
         deleted_checkpoints = _delete_s3_prefix(
@@ -500,7 +757,10 @@ def lambda_handler(event, context):
         return _response(204, {})
     claims = ((event.get("requestContext") or {}).get("authorizer") or {}).get("claims") or {}
     user_id = claims.get("sub")
-    if method in {"POST", "GET", "DELETE"} and path in {"/jobs", "/jobs/{job_id}"} and not user_id:
+    protected_paths = {
+        "/jobs", "/jobs/{job_id}", "/jobs/{job_id}/ask", "/jobs/{job_id}/asks/{ask_id}"
+    }
+    if method in {"POST", "GET", "DELETE"} and path in protected_paths and not user_id:
         return _response(401, {"error": "Autenticación requerida"})
     if method == "POST" and path == "/jobs":
         return create_job(event, user_id)
@@ -510,4 +770,8 @@ def lambda_handler(event, context):
         return get_job(event, user_id)
     if method == "DELETE" and path == "/jobs/{job_id}":
         return delete_job(event, user_id)
+    if method == "POST" and path == "/jobs/{job_id}/ask":
+        return create_ask(event, user_id)
+    if method == "GET" and path == "/jobs/{job_id}/asks/{ask_id}":
+        return get_ask(event, user_id)
     return _response(404, {"error": "Ruta no encontrada"})

@@ -1,5 +1,6 @@
 import json
 import logging
+from io import BytesIO
 from decimal import Decimal
 
 from app import jobs
@@ -57,6 +58,7 @@ def test_create_job_uses_verified_sub_and_owner_scoped_s3_key(monkeypatch):
     assert response["statusCode"] == 201
     created = table.created
     assert created["user_id"] == "cognito-sub-a"
+    assert "user_prompt" not in created
     assert created["object_key"].startswith(f"users/cognito-sub-a/jobs/{created['job_id']}/")
     assert "attacker" not in created["object_key"]
     assert captured["Params"]["Key"] == created["object_key"]
@@ -273,3 +275,25 @@ def test_upload_pending_head_access_denied_is_not_treated_as_missing(monkeypatch
     response = jobs.lambda_handler(event("GET", "/jobs/{job_id}", sub="owner-a", job_id="job-pending"), None)
 
     assert response["statusCode"] == 500
+
+
+def test_get_job_keeps_page_extractions_private_to_backend_context(monkeypatch):
+    table = FakeTable({
+        "job_id": "job-with-pages", "user_id": "owner-a", "status": "COMPLETED",
+        "result_key": "results/job-with-pages.json",
+    })
+    stored = {
+        "filename": "report.pdf", "pages": 1,
+        "transcription": {"text": "--- Página 1 ---\nContenido"},
+        "page_extractions": [{"page": 1, "transcription": "Contenido", "analysis_notes": ""}],
+    }
+    monkeypatch.setattr(jobs, "_table", lambda: table)
+    monkeypatch.setenv("RESULTS_BUCKET", "results")
+    monkeypatch.setattr(jobs.s3, "get_object", lambda **_kwargs: {"Body": BytesIO(json.dumps(stored).encode())})
+
+    response = jobs.lambda_handler(event("GET", "/jobs/{job_id}", sub="owner-a", job_id="job-with-pages"), None)
+
+    assert response["statusCode"] == 200
+    result = response_body(response)["result"]
+    assert result["transcription"]["text"].startswith("--- Página 1 ---")
+    assert "page_extractions" not in result

@@ -932,6 +932,18 @@ def _process_pdf(
     result = {
         "filename": filename,
         "pages": len(page_results),
+        # Persist page-scoped evidence in ResultsBucket so later questions can
+        # retrieve/cite exact pages without reopening the source PDF or rerunning
+        # PageExtraction. The legacy top-level result contract stays intact.
+        "page_extractions": [
+            {
+                "page": page_number,
+                "transcription": item.transcription,
+                "analysis_notes": item.analysis_notes,
+                "visual_elements": item.visual_elements.model_dump(mode="json"),
+            }
+            for page_number, item in enumerate(page_results, start=1)
+        ],
         **final.model_dump(),
     }
     log_event(

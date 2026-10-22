@@ -17,7 +17,7 @@ class AssembleTemplateTests(unittest.TestCase):
 
         resource_section = template.split("Resources:\n", 1)[1].split("\nOutputs:\n", 1)[0]
         logical_ids = re.findall(r"(?m)^  ([A-Za-z][A-Za-z0-9]*):\s*$", resource_section)
-        self.assertEqual(len(logical_ids), 35)
+        self.assertEqual(len(logical_ids), 45)
         self.assertEqual(len(logical_ids), len(set(logical_ids)))
         self.assertTrue(
             {
@@ -34,6 +34,13 @@ class AssembleTemplateTests(unittest.TestCase):
                 "JobsApiFunction",
                 "DocumentProcessorFunction",
                 "ProcessorTaskRole",
+                "QuestionQueue",
+                "QuestionDeadLetterQueue",
+                "QuestionTable",
+                "QuestionProcessorFunction",
+                "QuestionDlqReconcilerFunction",
+                "QuestionDlqReconcilerRole",
+                "QuestionDlqReconcilerLogGroup",
             }.issubset(logical_ids)
         )
 
@@ -64,6 +71,12 @@ class AssembleTemplateTests(unittest.TestCase):
             "QueueVisibilityTimeout",
             "FrontendOrigin",
             "MaxUserJobs",
+            "OllamaAskNumPredict",
+            "OllamaAskReadTimeout",
+            "OllamaAskContextMaxChars",
+            "QuestionQueueVisibilityTimeout",
+            "QuestionRetryDelaySeconds",
+            "MaxUserQuestionsPerDay",
         ):
             self.assertRegex(template, rf"(?m)^  {parameter}:")
 
@@ -127,6 +140,29 @@ class AssembleTemplateTests(unittest.TestCase):
         )
         self.assertIn("Cpu: '256'", template)
         self.assertIn("Memory: '1024'", template)
+
+    def test_questions_have_separate_authorized_async_path_and_short_lived_storage(self):
+        template = assemble_template()
+        self.assertIn("Path: /jobs/{job_id}/ask", template)
+        self.assertIn("Path: /jobs/{job_id}/asks/{ask_id}", template)
+        self.assertGreaterEqual(template.count("Authorizer: CognitoAuthorizer"), 6)
+        self.assertIn("Queue: !GetAtt QuestionQueue.Arn", template)
+        self.assertIn("ReservedConcurrentExecutions: 1", template)
+        self.assertIn("VisibilityTimeout: !Ref QuestionQueueVisibilityTimeout", template)
+        question_worker = template.split("  QuestionProcessorFunction:\n", 1)[1].split("\n  ", 1)[0]
+        self.assertNotIn("ScalingConfig:", question_worker)
+        self.assertIn("Handler: app.question_worker.lambda_dlq_handler", template)
+        self.assertIn("Handler: app.question_worker.lambda_handler", template)
+        self.assertIn("VisibilityTimeout: 180", template)
+        self.assertIn("QUESTION_RETRY_DELAY_SECONDS: !Ref QuestionRetryDelaySeconds", template)
+        self.assertIn("QUESTION_DLQ_URL: !Ref QuestionDeadLetterQueue", template)
+        self.assertRegex(template, r"(?ms)^  OllamaAskReadTimeout:\n    Type: Number\n    Default: 780\n    MinValue: 10\n    MaxValue: 780")
+        self.assertRegex(template, r"(?ms)^  QuestionQueueVisibilityTimeout:\n    Type: Number\n    Default: 5400\n    MinValue: 5400")
+        question_table = template.split("  QuestionTable:", 1)[1].split("\n  ", 1)[0]
+        self.assertIn("AttributeName: expires_at", template)
+        self.assertIn("Enabled: true", template)
+        self.assertIn("MaxUserQuestionsPerDay", template)
+        self.assertNotIn("DocumentQueueVisibilityTimeout", template)
 
 
 if __name__ == "__main__":
