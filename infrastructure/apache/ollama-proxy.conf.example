@@ -14,8 +14,9 @@ Listen 11443
     SSLProtocol -all +TLSv1.2 +TLSv1.3
 
     ProxyRequests Off
-    # Must exceed document-processor OLLAMA_READ_TIMEOUT (1200 by default).
-    ProxyTimeout 1300
+    # Fargate allows up to 1800s for one model call. Lambda has a shorter
+    # per-request budget; the coordinator bounds its FIFO wait separately.
+    ProxyTimeout 1900
 
     # The comparison runs before proxying. Missing/wrong Authorization is denied.
     SetEnvIfExpr "req('Authorization') == 'Bearer ${OLLAMA_API_TOKEN}'" ollama_token_valid
@@ -23,9 +24,10 @@ Listen 11443
         Require env ollama_token_valid
     </Location>
 
-    # Ollama remains bound to loopback; this vhost exposes only that backend.
-    ProxyPass        "/" "http://127.0.0.1:11434/" connectiontimeout=5 timeout=1300
-    ProxyPassReverse "/" "http://127.0.0.1:11434/"
+    # Ollama and the coordinator both remain loopback-only. AWS reaches only
+    # this TLS/Bearer-authenticated vhost; the coordinator serializes /api/chat.
+    ProxyPass        "/" "http://127.0.0.1:11435/" connectiontimeout=5 timeout=1900
+    ProxyPassReverse "/" "http://127.0.0.1:11435/"
 
     ErrorLog  ${APACHE_LOG_DIR}/ollama-proxy-error.log
     # Deliberately omit request headers; never add Authorization to a LogFormat.

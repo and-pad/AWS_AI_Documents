@@ -29,7 +29,7 @@ def active_ask(**overrides):
 
 
 def setup(monkeypatch, *, ask=None, job=None):
-    captured = {"terminal": [], "retry": [], "complete": [], "ollama": [], "s3": []}
+    captured = {"terminal": [], "retry": [], "complete": [], "ollama": [], "s3": [], "stages": []}
     monkeypatch.setattr(worker, "_table", lambda name: Table() if name == "QUESTION_TABLE" else object())
     monkeypatch.setattr(worker, "_claim_ask", lambda _table, *_args: dict(ask or active_ask()))
     monkeypatch.setattr(worker, "_load_completed_job", lambda *_args: job or {
@@ -46,9 +46,10 @@ def setup(monkeypatch, *, ask=None, job=None):
     monkeypatch.setattr(worker, "_complete_ask", lambda *args, **kwargs: captured["complete"].append((args, kwargs)) or True)
     monkeypatch.setattr(worker, "_set_terminal_error", lambda *args: captured["terminal"].append(args))
     monkeypatch.setattr(worker, "_release_for_retry", lambda *args: captured["retry"].append(args) or True)
-    monkeypatch.setattr(worker, "ask_ollama", lambda *args: captured["ollama"].append(args) or {"answer": "Ana", "source_pages": [1]})
+    monkeypatch.setattr(worker, "_set_processing_stage", lambda *args: captured["stages"].append(args[-1]) or True)
+    monkeypatch.setattr(worker, "ask_ollama", lambda *args, **kwargs: captured["ollama"].append((args, kwargs)) or {"answer": "Ana", "source_pages": [1]})
     monkeypatch.setenv("RESULTS_BUCKET", "private-results")
-    monkeypatch.setenv("OLLAMA_ASK_CONTEXT_MAX_CHARS", "16000")
+    monkeypatch.setenv("OLLAMA_ASK_NUM_CTX", "8192")
     monkeypatch.setenv("QUESTION_QUEUE_URL", "https://sqs.example.test/questions")
     monkeypatch.setattr(worker.sqs_client, "change_message_visibility", lambda **_kwargs: None)
     return captured
@@ -60,8 +61,10 @@ def test_worker_reads_only_authorized_completed_result_and_persists_answer(monke
     assert captured["s3"] == [{"Bucket": "private-results", "Key": "results/job-a.json"}]
     assert len(captured["ollama"]) == 1
     assert captured["complete"][0][0][1:4] == ("job-a", "ask-a", "user-a")
-    context = captured["ollama"][0][1]
+    assert captured["stages"] == ["WAITING_MODEL", "SAVING_RESULT"]
+    context = captured["ollama"][0][0][1]
     assert "La firmante es Ana." in context.text
+    assert captured["ollama"][0][1]["request_id"]
 
 
 def test_deleted_job_cannot_publish_answer_after_ollama_finishes(monkeypatch):
@@ -201,7 +204,7 @@ def test_removed_or_noncompleted_job_is_not_sent_to_ollama(monkeypatch):
 
 def test_transient_error_releases_claim_for_sqs_retry(monkeypatch):
     captured = setup(monkeypatch)
-    monkeypatch.setattr(worker, "ask_ollama", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(worker, "ask_ollama", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         QuestionModelError("read_timeout", "safe error", retryable=True)
     ))
     assert worker._process_message(record(receive_count=1)) is False
@@ -209,11 +212,24 @@ def test_transient_error_releases_claim_for_sqs_retry(monkeypatch):
     assert not captured["terminal"]
 
 
+def test_output_budget_exhaustion_fails_terminally_without_identical_sqs_retry(monkeypatch):
+    captured = setup(monkeypatch)
+    monkeypatch.setattr(worker, "ask_ollama", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        QuestionModelError("output_budget_exhausted", "safe output limit message", retryable=False)
+    ))
+
+    assert worker._process_message(record(receive_count=1)) is True
+    assert not captured["retry"]
+    assert len(captured["terminal"]) == 1
+    assert captured["terminal"][0][-1] == "output_budget_exhausted"
+    assert not captured["complete"]
+
+
 def test_transient_retry_uses_its_own_receipt_handle_and_short_backoff(monkeypatch):
     setup(monkeypatch)
     changes = []
     monkeypatch.setattr(worker.sqs_client, "change_message_visibility", lambda **kwargs: changes.append(kwargs))
-    monkeypatch.setattr(worker, "ask_ollama", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(worker, "ask_ollama", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         QuestionModelError("http_error", "safe error", retryable=True, http_status=502)
     ))
 
@@ -257,7 +273,7 @@ def test_unclassified_transaction_cancel_is_retried_safely(monkeypatch):
 
 def test_last_transient_failure_marks_ask_failed_and_leaves_message_for_dlq(monkeypatch):
     captured = setup(monkeypatch)
-    monkeypatch.setattr(worker, "ask_ollama", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(worker, "ask_ollama", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         QuestionModelError("read_timeout", "safe error", retryable=True)
     ))
     assert worker._process_message(record(receive_count=3)) is False
@@ -269,7 +285,7 @@ def test_last_transient_failure_releases_message_to_redrive_without_waiting_full
     setup(monkeypatch)
     changes = []
     monkeypatch.setattr(worker.sqs_client, "change_message_visibility", lambda **kwargs: changes.append(kwargs))
-    monkeypatch.setattr(worker, "ask_ollama", lambda *_args: (_ for _ in ()).throw(
+    monkeypatch.setattr(worker, "ask_ollama", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         QuestionModelError("read_timeout", "safe error", retryable=True)
     ))
     assert worker._process_message(record(receive_count=3)) is False
@@ -286,6 +302,82 @@ def test_result_error_does_not_log_document_question_or_token(monkeypatch, caplo
     assert "La firmante" not in caplog.text
     assert "private-results" not in caplog.text
     assert captured["terminal"]
+
+
+def test_terminal_failure_aliases_reserved_error_name_and_sets_terminal_stage():
+    class Capture:
+        name = "questions"
+
+        def update_item(self, **kwargs):
+            self.request = kwargs
+
+    table = Capture()
+    worker._set_terminal_error(table, "job-a", "ask-a", "owner", "safe message", "output_budget_exhausted")
+    request = table.request
+    assert "#error = :error" in request["UpdateExpression"]
+    assert request["ExpressionAttributeNames"]["#error"] == "error"
+    assert request["ExpressionAttributeValues"][":stage"] == "FAILED"
+    assert request["ExpressionAttributeValues"][":failed"] == "FAILED"
+    assert request["ExpressionAttributeValues"][":category"] == "output_budget_exhausted"
+    assert request["ExpressionAttributeValues"][":error"] == "safe message"
+    assert " error =" not in request["UpdateExpression"]
+
+
+def test_retry_release_sets_retrying_stage():
+    class Capture:
+        name = "questions"
+
+        def update_item(self, **kwargs):
+            self.request = kwargs
+
+    table = Capture()
+    assert worker._release_for_retry(table, "job-a", "ask-a", "owner") is True
+    assert table.request["ExpressionAttributeValues"][":stage"] == "RETRYING"
+
+
+def test_processing_stage_update_is_guarded_by_current_live_lease():
+    class Capture:
+        name = "questions"
+
+        def update_item(self, **kwargs):
+            self.request = kwargs
+
+    table = Capture()
+    assert worker._set_processing_stage(table, "job-a", "ask-a", "owner", "WAITING_MODEL") is True
+    assert table.request["ExpressionAttributeValues"][":stage"] == "WAITING_MODEL"
+    assert "processing_owner = :owner" in table.request["ConditionExpression"]
+    assert "processing_lease_until > :now" in table.request["ConditionExpression"]
+
+
+def test_completion_transaction_condition_checks_parent_job_and_sets_completed_stage(monkeypatch):
+    captured = {}
+
+    class Client:
+        def transact_write_items(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(worker, "dynamodb", type("Resource", (), {"meta": type("Meta", (), {"client": Client()})()})())
+    monkeypatch.setenv("JOBS_TABLE", "jobs")
+    assert worker._complete_ask(
+        Table(), "job-a", "ask-a", "user-a", "owner",
+        {"answer": "safe", "source_pages": [1]}, False,
+    ) is True
+    condition, update = captured["TransactItems"]
+    assert condition["ConditionCheck"]["TableName"] == "jobs"
+    assert update["Update"]["ExpressionAttributeValues"][":stage"] == "COMPLETED"
+
+
+def test_claim_sets_loading_context_stage_with_the_lease():
+    class Capture:
+        def update_item(self, **kwargs):
+            self.request = kwargs
+            return {"Attributes": {"status": "PROCESSING", "processing_stage": "LOADING_CONTEXT"}}
+
+    table = Capture()
+    claimed = worker._claim_ask(table, "job-a", "ask-a", "owner")
+    assert claimed["processing_stage"] == "LOADING_CONTEXT"
+    assert table.request["ExpressionAttributeValues"][":stage"] == "LOADING_CONTEXT"
+    assert "#stage = :stage" in table.request["UpdateExpression"]
 
 
 def test_lambda_handler_returns_partial_batch_failures_for_retryable_delivery(monkeypatch):
@@ -346,4 +438,3 @@ def test_malformed_non_object_sqs_body_is_acknowledged_without_worker_failure(mo
     bad = record()
     bad["body"] = "[]"
     assert worker.lambda_handler({"Records": [bad]}, None) == {"batchItemFailures": []}
-

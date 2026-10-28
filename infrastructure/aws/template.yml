@@ -52,9 +52,40 @@ Parameters:
 
   OllamaAskNumPredict:
     Type: Number
-    Default: 1000
+    Default: 2000
     MinValue: 1
-    Description: Maximum generated tokens for one answer to a question about a completed document.
+    Description: Maximum generated tokens for direct answers and drafts from the question worker; its context remains independent from PDF processing.
+
+  OllamaAskNumCtx:
+    Type: Number
+    Default: 8192
+    MinValue: 4096
+    Description: Independent context window for Qwen document questions; keep smaller than visual extraction when GPU memory is limited.
+
+  OllamaAskEvidenceNumPredict:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Output token budget for each bounded evidence pass used when the complete transcript needs hierarchical processing.
+
+  OllamaCoordinatorQueueWaitSeconds:
+    Type: Number
+    Default: 120
+    MinValue: 1
+    MaxValue: 600
+    Description: Maximum time a single inference request waits in the local coordinator before a retryable busy response.
+
+  OllamaCoordinatorRetryDelaySeconds:
+    Type: Number
+    Default: 900
+    MinValue: 1
+    MaxValue: 5400
+    Description: SQS delay used when the local inference coordinator is busy, preventing rapid retries while the GPU is occupied.
+
+  OllamaAskModel:
+    Type: String
+    Default: qwen3-vl:8b-instruct
+    Description: Model used only by the asynchronous document-question worker.
 
   OllamaAskReadTimeout:
     Type: Number
@@ -62,12 +93,6 @@ Parameters:
     MinValue: 10
     MaxValue: 780
     Description: Read timeout per question; the worker shortens it to retain at least 90 seconds for persistence and SQS response.
-
-  OllamaAskContextMaxChars:
-    Type: Number
-    Default: 16000
-    MinValue: 1000
-    Description: Maximum selected document evidence characters sent to one question request.
 
   QuestionQueueVisibilityTimeout:
     Type: Number

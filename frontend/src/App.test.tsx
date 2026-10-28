@@ -275,6 +275,7 @@ describe('job history restoration', () => {
   it('asks the API using the owning card job id and keeps answers isolated between documents', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.mocked(fetch)
+    let askStatusReads = 0
     fetchMock.mockImplementation(async (input, init) => {
       const url = String(input)
       if (url.endsWith('/jobs') && !init?.method) {
@@ -284,9 +285,16 @@ describe('job history restoration', () => {
         ], count: 2, limit: 20 })
       }
       if (url.endsWith('/jobs/document-a/ask')) return jsonResponse({ job_id: 'document-a', ask_id: 'ask-a', status: 'PENDING' }, 202)
-      if (url.endsWith('/jobs/document-a/asks/ask-a')) return jsonResponse({
-        job_id: 'document-a', ask_id: 'ask-a', status: 'COMPLETED', answer: 'Respuesta exclusiva de A', source_pages: [2],
-      })
+      if (url.endsWith('/jobs/document-a/asks/ask-a')) {
+        askStatusReads += 1
+        if (askStatusReads === 1) return jsonResponse({
+          job_id: 'document-a', ask_id: 'ask-a', status: 'PROCESSING', processing_stage: 'WAITING_MODEL',
+        })
+        return jsonResponse({
+          job_id: 'document-a', ask_id: 'ask-a', status: 'COMPLETED', processing_stage: 'COMPLETED',
+          answer: 'Respuesta exclusiva de A', source_pages: [2],
+        })
+      }
       const jobId = url.endsWith('/jobs/document-a') ? 'document-a' : 'document-b'
       return jsonResponse({
         job_id: jobId,
@@ -313,6 +321,10 @@ describe('job history restoration', () => {
     fireEvent.click(within(cardA).getByRole('button', { name: 'Preguntar' }))
     await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
     await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(within(cardA).getByText('Esperando respuesta de la IA (puede estar en cola o procesando).')).toBeTruthy()
+    expect(within(cardA).queryByText('Respuesta exclusiva de A')).toBeNull()
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
     expect(fetchMock.mock.calls.some(([input, init]) =>
@@ -359,7 +371,62 @@ describe('job history restoration', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('keeps a pending backend ask pending after the local polling window and allows resuming', async () => {
+  it('does not present COMPLETED until the status response includes the answer', async () => {
+    vi.useFakeTimers()
+    let statusReads = 0
+    const fetchMock = vi.mocked(fetch)
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url.endsWith('/jobs') && !init?.method) return jsonResponse({
+        jobs: [{ job_id: 'answer-guard', status: 'COMPLETED', filename: 'a.pdf' }], count: 1, limit: 20,
+      })
+      if (url.endsWith('/jobs/answer-guard/ask')) return jsonResponse({
+        job_id: 'answer-guard', ask_id: 'ask-answer-guard', status: 'PENDING', processing_stage: 'QUEUED',
+      }, 202)
+      if (url.endsWith('/jobs/answer-guard/asks/ask-answer-guard')) {
+        statusReads += 1
+        return statusReads === 1
+          ? jsonResponse({ job_id: 'answer-guard', ask_id: 'ask-answer-guard', status: 'COMPLETED' })
+          : jsonResponse({
+            job_id: 'answer-guard', ask_id: 'ask-answer-guard', status: 'COMPLETED',
+            processing_stage: 'COMPLETED', answer: 'Respuesta recuperada', source_pages: [1],
+          })
+      }
+      return jsonResponse({
+        job_id: 'answer-guard', status: 'COMPLETED', filename: 'a.pdf',
+        result: {
+          filename: 'a.pdf', pages: 1,
+          analysis: { document_type: 'Carta', summary: 'Resumen', key_points: [] },
+          transcription: { text: 'Texto' },
+          visual_elements: { stamps: [], signatures: [], other_marks: [] },
+          requested_output: { user_request: '', response: null },
+        },
+      })
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    const card = screen.getByText('ID: answer-guard').closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: /Preguntar a la IA/ }))
+    await act(async () => { await Promise.resolve() })
+    fireEvent.change(within(card).getByLabelText('Tu pregunta'), { target: { value: '¿Qué dice?' } })
+    fireEvent.click(within(card).getByRole('button', { name: 'Preguntar' }))
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+
+    expect(within(card).queryByText('Respuesta lista.')).toBeNull()
+    expect(within(card).queryByText('Respuesta recuperada')).toBeNull()
+    expect(within(card).getByText(/La consulta figura como lista/)).toBeTruthy()
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Revisar estado' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    expect(within(card).getByText('Respuesta recuperada')).toBeTruthy()
+    expect(statusReads).toBe(2)
+  })
+
+  it('keeps a pending backend ask pending after the bounded polling window and allows resuming', async () => {
     vi.useFakeTimers()
     let now = 1_000_000
     vi.spyOn(Date, 'now').mockImplementation(() => now)
@@ -376,8 +443,8 @@ describe('job history restoration', () => {
       if (url.endsWith('/jobs/slow-job/asks/ask-slow')) {
         statusReads += 1
         if (statusReads === 1) {
-          now += 20 * 60 * 1000 + 1
-          return jsonResponse({ job_id: 'slow-job', ask_id: 'ask-slow', status: 'PROCESSING' })
+          now += 60 * 60 * 1000 + 1
+          return jsonResponse({ job_id: 'slow-job', ask_id: 'ask-slow', status: 'PROCESSING', processing_stage: 'WAITING_MODEL' })
         }
         return jsonResponse({
           job_id: 'slow-job', ask_id: 'ask-slow', status: 'COMPLETED',
@@ -407,7 +474,7 @@ describe('job history restoration', () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(2500) })
     await act(async () => { await Promise.resolve(); await Promise.resolve() })
 
-    expect(within(card).getByText('Buscando en el documento…')).toBeTruthy()
+    expect(within(card).getByText('Esperando respuesta de la IA (puede estar en cola o procesando).')).toBeTruthy()
     expect(within(card).getByText(/Se detuvo la consulta automática/)).toBeTruthy()
     expect(within(card).queryByText('No se pudo responder la pregunta.')).toBeNull()
 

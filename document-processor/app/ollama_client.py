@@ -1,13 +1,15 @@
 import base64
 import hashlib
 import logging
+import os
 import time
+import uuid
 from copy import deepcopy
 
 import requests
 
 from app.settings import get_settings
-from app.diagnostics import log_event
+from app.diagnostics import current_diagnostic_context, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +81,16 @@ class OllamaClient:
         if image is not None:
             encoded = base64.b64encode(image).decode("ascii")
             payload_messages[-1]["images"] = [encoded]
-        headers = {"Authorization": f"Bearer {self.api_token}"} if self.api_token else None
+        context = current_diagnostic_context()
+        request_id = context.get("ollama_request_id") or str(uuid.uuid4())
+        queue_wait_seconds = int(os.getenv("OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS", "120"))
+        headers = {
+            "X-Request-ID": request_id,
+            "X-Coordinator-Queue-Wait-Seconds": str(queue_wait_seconds),
+            "X-Coordinator-Request-Timeout-Seconds": str(self.timeout[1]),
+        }
+        if self.api_token:
+            headers["Authorization"] = f"Bearer {self.api_token}"
         transport_failure: tuple[str, str, Exception] | None = None
         try:
             payload = {"model": self.model, "stream": False, "messages": payload_messages}

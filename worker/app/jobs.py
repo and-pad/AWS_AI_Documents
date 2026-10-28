@@ -496,6 +496,7 @@ def create_ask(event: dict, user_id: str) -> dict:
         "user_id": user_id,
         "question": question,
         "status": "PENDING",
+        "processing_stage": "QUEUED",
         "created_at": now,
         "updated_at": now,
         "expires_at": expires_at,
@@ -523,12 +524,13 @@ def create_ask(event: dict, user_id: str) -> dict:
         try:
             _question_table().update_item(
                 Key={"job_id": job_id, "ask_id": ask_id},
-                UpdateExpression="SET #status = :failed, error = :error, updated_at = :updated",
+                UpdateExpression="SET #status = :failed, #stage = :stage, #error = :error, error_category = :category, updated_at = :updated",
                 ConditionExpression="#status = :pending",
-                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage", "#error": "error"},
                 ExpressionAttributeValues={
                     ":failed": "FAILED", ":pending": "PENDING",
-                    ":error": "No se pudo poner la consulta en cola.", ":updated": _now(),
+                    ":stage": "FAILED", ":error": "No se pudo poner la consulta en cola.",
+                    ":category": "queue_publish_failed", ":updated": _now(),
                 },
             )
         except Exception:
@@ -536,7 +538,9 @@ def create_ask(event: dict, user_id: str) -> dict:
         logger.exception("No se pudo enviar una consulta a SQS job_id=%s ask_id=%s", job_id, ask_id)
         return _response(503, {"error": "No se pudo iniciar la consulta. Inténtalo nuevamente."})
     logger.info("ASK_CREATED job_id=%s ask_id=%s status=PENDING", job_id, ask_id)
-    return _response(202, {"job_id": job_id, "ask_id": ask_id, "status": "PENDING"})
+    return _response(202, {
+        "job_id": job_id, "ask_id": ask_id, "status": "PENDING", "processing_stage": "QUEUED",
+    })
 
 
 def get_ask(event: dict, user_id: str) -> dict:
@@ -568,8 +572,15 @@ def get_ask(event: dict, user_id: str) -> dict:
             ).get("Item")
             if not item or item.get("user_id") != user_id:
                 return _response(404, {"error": "Consulta no encontrada"})
-        public_fields = ("job_id", "ask_id", "status", "answer", "source_pages", "context_limited", "created_at", "completed_at", "error")
-        return _response(200, {field: item[field] for field in public_fields if field in item})
+        public_fields = (
+            "job_id", "ask_id", "status", "processing_stage", "answer", "source_pages",
+            "context_limited", "context_mode", "model", "created_at", "completed_at", "error",
+        )
+        public_item = {field: item[field] for field in public_fields if field in item}
+        # Expose a stable category, never an AWS exception message or traceback.
+        if isinstance(item.get("error_category"), str):
+            public_item["error_code"] = item["error_category"]
+        return _response(200, public_item)
     except Exception:
         logger.exception("No se pudo consultar el estado de una pregunta job_id=%s ask_id=%s", job_id, ask_id)
         return _response(500, {"error": "No se pudo consultar la pregunta"})
@@ -593,7 +604,7 @@ def _mark_stale_ask_failed(item: dict, user_id: str) -> None:
         _question_table().update_item(
             Key={"job_id": item["job_id"], "ask_id": item["ask_id"]},
             UpdateExpression=(
-                "SET #status = :failed, error = :error, error_category = :category, "
+                "SET #status = :failed, #stage = :stage, #error = :error, error_category = :category, "
                 "failed_at = :now, updated_at = :now "
                 "REMOVE processing_owner, processing_lease_until"
             ),
@@ -601,9 +612,10 @@ def _mark_stale_ask_failed(item: dict, user_id: str) -> None:
                 "user_id = :owner AND expires_at > :epoch AND updated_at = :previous "
                 "AND (#status = :pending OR #status = :processing)"
             ),
-            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage", "#error": "error"},
             ExpressionAttributeValues={
                 ":failed": "FAILED",
+                ":stage": "FAILED",
                 ":error": "La consulta excedió el tiempo máximo de recuperación. Puedes intentarlo nuevamente.",
                 ":category": "stale_recovery_timeout",
                 ":now": _now(),

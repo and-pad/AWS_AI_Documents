@@ -71,9 +71,14 @@ class AssembleTemplateTests(unittest.TestCase):
             "QueueVisibilityTimeout",
             "FrontendOrigin",
             "MaxUserJobs",
+            "OllamaModel",
+            "OllamaAskModel",
             "OllamaAskNumPredict",
+            "OllamaAskNumCtx",
+            "OllamaAskEvidenceNumPredict",
             "OllamaAskReadTimeout",
-            "OllamaAskContextMaxChars",
+            "OllamaCoordinatorQueueWaitSeconds",
+            "OllamaCoordinatorRetryDelaySeconds",
             "QuestionQueueVisibilityTimeout",
             "QuestionRetryDelaySeconds",
             "MaxUserQuestionsPerDay",
@@ -126,7 +131,19 @@ class AssembleTemplateTests(unittest.TestCase):
         self.assertIn("Name: OLLAMA_PAGE_NUM_PREDICT\n              Value: !Ref OllamaPageNumPredict", processor)
         self.assertIn("Name: OLLAMA_SYNTHESIS_NUM_PREDICT\n              Value: !Ref OllamaSynthesisNumPredict", processor)
         self.assertIn("Name: OLLAMA_NUM_CTX\n              Value: !Ref OllamaNumCtx", processor)
+        self.assertIn("Name: OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS\n              Value: !Ref OllamaCoordinatorQueueWaitSeconds", processor)
         self.assertIn("maxReceiveCount: 3", template)
+
+    def test_visual_and_question_models_have_independent_settings(self):
+        template = assemble_template()
+        self.assertRegex(template, r"(?ms)^  OllamaModel:\n    Type: String\n    Default: qwen3-vl:8b-instruct")
+        self.assertRegex(template, r"(?ms)^  OllamaAskModel:\n    Type: String\n    Default: qwen3-vl:8b-instruct")
+        self.assertRegex(template, r"(?ms)^  OllamaAskNumPredict:\n    Type: Number\n    Default: 2000")
+        self.assertRegex(template, r"(?ms)^  OllamaAskNumCtx:\n    Type: Number\n    Default: 8192")
+        self.assertIn("Name: OLLAMA_MODEL\n              Value: !Ref OllamaModel", template)
+        self.assertIn("OLLAMA_ASK_MODEL: !Ref OllamaAskModel", template)
+        self.assertIn("OLLAMA_ASK_NUM_CTX: !Ref OllamaAskNumCtx", template)
+        self.assertNotIn("OLLAMA_ASK_CONTEXT_MAX_CHARS", template)
 
     def test_processor_concurrency_is_configurable_without_changing_task_count(self):
         template = assemble_template()
@@ -147,10 +164,17 @@ class AssembleTemplateTests(unittest.TestCase):
         self.assertIn("Path: /jobs/{job_id}/asks/{ask_id}", template)
         self.assertGreaterEqual(template.count("Authorizer: CognitoAuthorizer"), 6)
         self.assertIn("Queue: !GetAtt QuestionQueue.Arn", template)
-        self.assertIn("ReservedConcurrentExecutions: 1", template)
         self.assertIn("VisibilityTimeout: !Ref QuestionQueueVisibilityTimeout", template)
-        question_worker = template.split("  QuestionProcessorFunction:\n", 1)[1].split("\n  ", 1)[0]
-        self.assertNotIn("ScalingConfig:", question_worker)
+        question_worker = re.search(
+            r"(?ms)^  QuestionProcessorFunction:\n(.*?)(?=^  QuestionDlqReconcilerRole:)",
+            template,
+        ).group(1)
+        question_dlq_worker = template.split("  QuestionDlqReconcilerFunction:\n", 1)[1]
+        for worker in (question_worker, question_dlq_worker):
+            self.assertNotIn("ReservedConcurrentExecutions:", worker)
+            self.assertIn("BatchSize: 1", worker)
+            self.assertIn("MaximumConcurrency: 2", worker)
+            self.assertIn("ReportBatchItemFailures", worker)
         self.assertIn("Handler: app.question_worker.lambda_dlq_handler", template)
         self.assertIn("Handler: app.question_worker.lambda_handler", template)
         self.assertIn("VisibilityTimeout: 180", template)
@@ -163,6 +187,45 @@ class AssembleTemplateTests(unittest.TestCase):
         self.assertIn("Enabled: true", template)
         self.assertIn("MaxUserQuestionsPerDay", template)
         self.assertNotIn("DocumentQueueVisibilityTimeout", template)
+
+    def test_jobs_api_can_execute_question_transaction_with_table_scoped_permissions(self):
+        template = assemble_template()
+        jobs_api = re.search(
+            r"(?ms)^  JobsApiFunction:\n(.*?)(?=^  QuestionProcessorRole:)",
+            template,
+        ).group(1)
+
+        self.assertRegex(
+            jobs_api,
+            r"(?s)Action:\n\s+- dynamodb:GetItem\n\s+- dynamodb:PutItem\n"
+            r"\s+- dynamodb:UpdateItem\n\s+- dynamodb:DeleteItem\n"
+            r"\s+- dynamodb:TransactWriteItems\n\s+- dynamodb:ConditionCheckItem\n"
+            r"\s+Resource: !GetAtt JobsTable.Arn",
+        )
+        self.assertRegex(
+            jobs_api,
+            r"(?s)Action:\n\s+- dynamodb:GetItem\n\s+- dynamodb:PutItem\n"
+            r"\s+- dynamodb:UpdateItem\n\s+- dynamodb:DeleteItem\n"
+            r"\s+- dynamodb:Query\n\s+- dynamodb:TransactWriteItems\n"
+            r"\s+Resource: !GetAtt QuestionTable.Arn",
+        )
+        self.assertNotIn("dynamodb:*", jobs_api)
+
+    def test_question_worker_can_condition_check_only_the_parent_jobs_table(self):
+        template = assemble_template()
+        processor_role = re.search(
+            r"(?ms)^  QuestionProcessorRole:\n(.*?)(?=^  QuestionProcessorFunction:)",
+            template,
+        ).group(1)
+        self.assertRegex(
+            processor_role,
+            r"(?s)Action: dynamodb:ConditionCheckItem\n\s+Resource: !GetAtt JobsTable.Arn",
+        )
+        self.assertNotRegex(
+            processor_role,
+            r"(?s)Action: dynamodb:ConditionCheckItem\n\s+Resource:.*QuestionTable",
+        )
+        self.assertNotIn("dynamodb:*", processor_role)
 
 
 if __name__ == "__main__":

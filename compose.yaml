@@ -8,7 +8,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-${OLLAMA_URL:-http://host.docker.internal:11434}}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-${OLLAMA_URL:-http://host.docker.internal:11435}}
       OLLAMA_API_TOKEN: ${OLLAMA_API_TOKEN:-}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:8b-instruct}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
@@ -19,5 +19,6 @@ services:
       OLLAMA_PAGE_NUM_PREDICT: ${OLLAMA_PAGE_NUM_PREDICT:-6000}
       OLLAMA_SYNTHESIS_NUM_PREDICT: ${OLLAMA_SYNTHESIS_NUM_PREDICT:-2000}
       OLLAMA_READ_TIMEOUT: ${OLLAMA_READ_TIMEOUT:-1800}
+      OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS: ${OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS:-120}
       PROCESSOR_MAX_CONCURRENT_JOBS: ${PROCESSOR_MAX_CONCURRENT_JOBS:-1}
     restart: unless-stopped

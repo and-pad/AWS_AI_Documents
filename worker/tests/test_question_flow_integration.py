@@ -68,6 +68,7 @@ def test_question_completes_from_owned_persisted_result_and_is_visible_through_a
     ), None)
     created_body = json.loads(created["body"])
     assert created["statusCode"] == 202
+    assert created_body["processing_stage"] == "QUEUED"
     ask_id = created_body["ask_id"]
     message_body = json.loads(queue.messages[0]["MessageBody"])
     assert message_body == {"job_id": job_id, "ask_id": ask_id, "user_id": "user-123"}
@@ -79,18 +80,26 @@ def test_question_completes_from_owned_persisted_result_and_is_visible_through_a
     }[name])
     monkeypatch.setenv("JOBS_TABLE", "jobs")
     monkeypatch.setenv("RESULTS_BUCKET", "private-results")
-    monkeypatch.setenv("OLLAMA_ASK_CONTEXT_MAX_CHARS", "16000")
+    monkeypatch.setenv("OLLAMA_ASK_NUM_CTX", "8192")
     monkeypatch.setattr(question_worker, "_token", lambda: "")
 
     def claim(_table, claimed_job_id, claimed_ask_id, owner):
         assert claimed_job_id == job_id
         item = question_table.items[(claimed_job_id, claimed_ask_id)]
         assert item["status"] == "PENDING"
-        item.update(status="PROCESSING", processing_owner=owner, processing_attempt=1,
+        item.update(status="PROCESSING", processing_stage="LOADING_CONTEXT", processing_owner=owner, processing_attempt=1,
                     processing_lease_until=int(time.time()) + 960)
         return dict(item)
 
     monkeypatch.setattr(question_worker, "_claim_ask", claim)
+    def stage(_table, staged_job_id, staged_ask_id, owner, value):
+        assert (staged_job_id, staged_ask_id) == (job_id, ask_id)
+        item = question_table.items[(job_id, ask_id)]
+        assert item["processing_owner"] == owner
+        item["processing_stage"] = value
+        return True
+
+    monkeypatch.setattr(question_worker, "_set_processing_stage", stage)
 
     def load_result(bucket, key):
         assert bucket == "private-results"
@@ -104,7 +113,7 @@ def test_question_completes_from_owned_persisted_result_and_is_visible_through_a
         }
 
     monkeypatch.setattr(question_worker, "_load_result", load_result)
-    monkeypatch.setattr(question_worker, "ask_ollama", lambda _question, context, _token, _timeout: (
+    monkeypatch.setattr(question_worker, "ask_ollama", lambda _question, context, _token, _timeout, **_kwargs: (
         captured["contexts"].append(context.text) or {"answer": "Entregar el informe mensual.", "source_pages": [2]}
     ))
 
@@ -113,7 +122,7 @@ def test_question_completes_from_owned_persisted_result_and_is_visible_through_a
         assert job_table.items[(job_id, None)]["status"] == "COMPLETED"
         item = question_table.items[(job_id, ask_id)]
         assert item["status"] == "PROCESSING" and item["processing_owner"] == owner
-        item.update(status="COMPLETED", answer=answer["answer"], source_pages=answer["source_pages"],
+        item.update(status="COMPLETED", processing_stage="COMPLETED", answer=answer["answer"], source_pages=answer["source_pages"],
                     context_limited=context_limited)
         item.pop("processing_owner")
         item.pop("processing_lease_until")
@@ -139,5 +148,6 @@ def test_question_completes_from_owned_persisted_result_and_is_visible_through_a
     assert status_body["job_id"] == job_id
     assert status_body["ask_id"] == ask_id
     assert status_body["status"] == "COMPLETED"
+    assert status_body["processing_stage"] == "COMPLETED"
     assert status_body["answer"] == "Entregar el informe mensual."
     assert status_body["source_pages"] == [2]

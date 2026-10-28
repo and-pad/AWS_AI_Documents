@@ -5,8 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
 # LocalStack Lambda containers run on Docker's default bridge. The processor's
-# published port is reachable through that bridge's host gateway. Resolve the
-# gateway from Docker instead of baking a machine-specific address into SAM.
+# published port and host inference coordinator are reachable through that
+# bridge's host gateway. Resolve it instead of baking a machine-specific address.
 host_gateway="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
 if [[ -z "$host_gateway" ]]; then
   echo "No se pudo determinar el gateway de la red Docker bridge" >&2
@@ -24,7 +24,7 @@ lstk sam deploy \
     ProcessorDeployment=local \
     QueueVisibilityTimeout=900 \
     FrontendOrigin=http://localhost:5173 \
-    "OllamaBaseUrl=http://${host_gateway}:11434" \
+    "OllamaBaseUrl=http://${host_gateway}:11435" \
     "DocumentProcessorUrl=http://${host_gateway}:8000/process"
 
 # LocalStack's SAM deploy left the template's ReservedConcurrentExecutions

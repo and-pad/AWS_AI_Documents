@@ -263,7 +263,11 @@ def test_ollama_client_sends_configured_bearer_token(monkeypatch):
 
     assert OllamaClient().chat([{"role": "user", "content": "hello"}]) == "ok"
     assert OllamaClient().url == "https://la-ea.duckdns.org:11443"
-    assert calls[0][1]["headers"] == {"Authorization": "Bearer unit-test-token"}
+    headers = calls[0][1]["headers"]
+    assert headers["Authorization"] == "Bearer unit-test-token"
+    assert headers["X-Request-ID"]
+    assert headers["X-Coordinator-Queue-Wait-Seconds"] == "120"
+    assert headers["X-Coordinator-Request-Timeout-Seconds"] == "1800"
 
 
 def test_ollama_client_sends_json_schema_as_format(monkeypatch):
@@ -463,7 +467,9 @@ def test_ollama_client_omits_auth_header_without_local_token(monkeypatch):
     monkeypatch.setattr("app.ollama_client.requests.post", lambda *args, **kwargs: (calls.append(kwargs) or response))
 
     assert OllamaClient().chat([{"role": "user", "content": "hello"}]) == "ok"
-    assert calls[0]["headers"] is None
+    headers = calls[0]["headers"]
+    assert "Authorization" not in headers
+    assert headers["X-Request-ID"]
 
 
 def test_ollama_token_is_not_logged_or_included_in_exception(monkeypatch, caplog):

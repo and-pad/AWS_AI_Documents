@@ -14,10 +14,11 @@ document-processor/app/
   settings.py                     Variables de entorno y límites
 worker/app/
   jobs.py                         API de alta/consulta y URLs S3 prefirmadas
-  worker.py                       Consumidor Lambda legado, sin trigger productivo
+  question_worker.py              Consumidor Lambda asíncrono de preguntas
 infrastructure/aws/template.yml   Manifiesto SAM con parámetros globales, Outputs y módulos de recursos
 infrastructure/aws/stacks/        Fragmentos por dominio; el ensamblador conserva un solo stack CloudFormation
 infrastructure/aws/assemble_template.py  Ensambla los fragmentos para SAM sin cambiar Logical IDs
+ollama-coordinator/                Servicio loopback que serializa /api/chat para ambos modelos
 compose.yaml                      document-processor local
 ```
 
@@ -29,17 +30,18 @@ compose.yaml                      document-processor local
 4. S3 envía el evento a `DocumentQueue`. Una task Fargate inicia `PROCESSOR_MAX_CONCURRENT_JOBS` consumidores SQS independientes (1 por defecto, máximo 2); cada consumidor hace long polling de un mensaje y no recibe otro hasta terminar el actual. No se reserva un tercer mensaje mientras los dos slots estén ocupados. La task procesa el PDF directamente en el contenedor; no hay una Lambda esperando una llamada HTTP larga. La transición condicional y la lease DynamoDB impiden que mensajes duplicados o una task nueva durante un despliegue inicien el mismo job a la vez. Las keys antiguas `jobs/{job_id}/{filename}` siguen siendo reconocidas.
 5. `document-processor` abre el PDF con PyMuPDF, rasteriza una página cada vez, envía la imagen a Ollama y produce el análisis página a página. Al pedir cada página, incluye un `context_summary` limitado a `CONTEXT_MAX_CHARS`; el modelo lo actualiza con entidades, datos del documento y continuidad relevantes. Los análisis detallados no se reutilizan como contexto y se conservan completos para la consolidación final. La síntesis inicial es neutral: no depende de una pregunta del usuario.
 6. La task guarda el resultado JSON bajo la clave determinística `results/{job_id}.json`, incluidos los campos generales y las extracciones validadas por página, confirma la escritura, persiste `COMPLETED` y `result_key` en DynamoDB y solo entonces elimina el PDF de `DocumentsBucket`. Un retry antes de actualizar DynamoDB vuelve a escribir la misma clave y reemplaza el objeto existente. Si el procesamiento falla, no borra el mensaje ni el PDF: antes del tercer receive vuelve el job a `QUEUED`; en el tercero queda `FAILED` y SQS lo redirige a la DLQ. La API `GET /jobs/{job_id}` solo entrega el resultado si el `sub` coincide con `user_id`.
-7. Cada documento `COMPLETED` ofrece **Preguntar a la IA**. `POST /jobs/{job_id}/ask` valida Cognito/ownership, crea un `ask_id` y encola solo identificadores en `QuestionQueue`; una Lambda separada lee `results/{job_id}.json`, selecciona fragmentos pertinentes y consulta Ollama. React consulta `GET /jobs/{job_id}/asks/{ask_id}` hasta un estado terminal. Esta ruta no vuelve a abrir el PDF ni ejecuta PageExtraction/FinalSynthesis; la cola de preguntas está separada de `DocumentQueue`.
+7. Cada documento `COMPLETED` ofrece **Preguntar a la IA**. `POST /jobs/{job_id}/ask` valida Cognito/ownership, crea un `ask_id` y encola solo identificadores en `QuestionQueue`; la Lambda lee `results/{job_id}.json` y envía la transcripción original completa a Qwen3-VL Instruct cuando cabe. Si excede el contexto, la transcripción se procesa íntegra por secciones con citas verificadas; si requiere más secciones de las admitidas, la consulta falla explícitamente sin omitir páginas. React consulta `GET /jobs/{job_id}/asks/{ask_id}` hasta un estado terminal. Esta ruta no vuelve a abrir el PDF ni ejecuta PageExtraction/FinalSynthesis; la cola de preguntas está separada de `DocumentQueue`.
+8. Fargate y la Lambda de preguntas utilizan el mismo endpoint Apache HTTPS/Bearer, que reenvía `/api/chat` al coordinador en loopback (y, opcionalmente, a la interfaz privada de Docker para desarrollo local). Este mantiene una cola FIFO acotada y ejecuta una inferencia cada vez: `qwen3-vl:8b-instruct` para extracción/síntesis y preguntas, con prompts y presupuestos independientes. Las páginas de un PDF siguen secuenciales y cada llamada individual obtiene su turno.
 
 El bucket de resultados está separado del bucket de entrada: este último envía eventos S3 a SQS, por lo que guardar el resultado en el mismo bucket volvería a activar el worker. Los jobs/resultados se conservan hasta que el usuario elimina el job. Los PDFs son temporales: el worker los elimina al completar y el lifecycle de `DocumentsBucket` expira objetos restantes después de 30 días; es solo un fallback para objetos huérfanos y deja margen para esperas, reintentos y mensajes en DLQ.
 
 ## Ollama y document-processor local
 
-Requiere Docker Compose, Ollama en el host local de desarrollo y el modelo descargado. El siguiente bind `0.0.0.0` aplica solo a ese entorno local para que Docker llegue al host; el servidor Ollama remoto de producción permanece en `127.0.0.1:11434` detrás de Apache:
+Requiere Docker Compose, Ollama y el coordinador local instalados en el host. Ollama conserva su bind `127.0.0.1:11434`; el coordinador escucha en `127.0.0.1:11435`:
 
 ```bash
-OLLAMA_HOST=0.0.0.0:11434 ollama serve
-ollama pull qwen3-vl:8b-instruct
+ollama serve
+ollama list
 curl http://localhost:11434/api/tags
 ```
 
@@ -52,16 +54,17 @@ curl http://localhost:8000/health
 docker compose logs -f document-processor
 ```
 
-En Docker Desktop `host.docker.internal` suele estar disponible. En Linux Compose añade `host.docker.internal:host-gateway`, así que `OLLAMA_BASE_URL=http://host.docker.internal:11434` apunta al host sin fijar una IP. También se acepta `OLLAMA_URL` como alias para archivos `.env` anteriores. Si Ollama corre en otro contenedor de la misma red Docker, configura `OLLAMA_BASE_URL=http://ollama:11434`; no se instala Ollama dentro de `document-processor`.
+En Docker Desktop `host.docker.internal` suele estar disponible. En Linux Compose añade `host.docker.internal:host-gateway`, así que `OLLAMA_BASE_URL=http://host.docker.internal:11435` apunta al coordinador del host sin publicar su puerto. También se acepta `OLLAMA_URL` como alias legado. Configurar la app directamente al puerto `11434` omite la serialización.
 
 Las variables disponibles son:
 
 | Variable | Predeterminado | Uso |
 | --- | --- | --- |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` en proceso directo; Compose lo establece a `http://host.docker.internal:11434` | Base URL de Ollama; local/AWS se configura sin cambios de código |
+| `OLLAMA_BASE_URL` | `http://localhost:11435` en local con coordinador | Base URL del coordinador; AWS conserva el hostname HTTPS de Apache |
 | `OLLAMA_URL` | Alias legado de `OLLAMA_BASE_URL` | Compatibilidad con `.env` anteriores |
 | `OLLAMA_API_TOKEN` | Vacío en desarrollo local | Bearer token opcional; en AWS ECS lo inyecta Secrets Manager |
 | `OLLAMA_MODEL` | `qwen3-vl:8b-instruct` | Modelo Ollama |
+| `OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS` | `120` | Tiempo máximo en cola antes de un 503 recuperable |
 | `CORS_ORIGINS` | `http://localhost:5173` | Orígenes permitidos por FastAPI |
 | `MAX_UPLOAD_BYTES` | `20971520` | Máximo 20 MiB |
 | `PDF_RENDER_DPI` | `180` | Resolución de render de páginas |
@@ -74,6 +77,37 @@ Las variables disponibles son:
 | `SQS_VISIBILITY_TIMEOUT` | `900` | Ventana de visibilidad renovable del mensaje de producción. |
 | `SQS_VISIBILITY_HEARTBEAT_SECONDS` | `300` | Intervalo de renovación de visibilidad y lease. |
 | `PROCESSOR_MAX_CONCURRENT_JOBS` | `1` | Consumidores independientes por task Fargate; admite `1` o `2`. Cada job conserva sus páginas secuenciales. |
+
+### Coordinador local de inferencias
+
+`ollama-coordinator/` ejecuta un solo proceso Uvicorn (`--workers 1`) con un lock exclusivo. Un dispatcher consume su cola FIFO acotada y mantiene una inferencia upstream a la vez. Si el cliente se desconecta o vence su plazo, cancela la solicitud HTTP upstream y no libera el turno hasta que esa solicitud haya terminado de cerrarse; Ollama debe observar el cierre para detener la generación. El servicio limita peticiones/respuestas en memoria y no registra mensajes, imágenes, preguntas, credenciales ni respuestas. `/health` muestra si el dispatcher vive, el modelo activo, solicitudes pendientes y latencias agregadas. `/api/chat` conserva la interfaz Ollama de Fargate y Lambda. Un `503 coordinator_busy` retrasa el retry SQS de preguntas 900 segundos.
+
+Instalación manual en el host de Ollama (no se ejecuta desde el pipeline AWS):
+
+```bash
+ollama list
+ollama ps
+nvidia-smi
+sudo ./ollama-coordinator/scripts/install.sh
+curl --fail http://127.0.0.1:11435/health
+```
+
+La instalación activa únicamente el servicio coordinador; no reinicia ni configura Ollama y no cambia Apache. Para configurar como defensa adicional un modelo cargado a la vez y un slot, revisa primero memoria/modelos y ejecuta manualmente `sudo ./ollama-coordinator/scripts/apply-ollama-limits.sh`. Solicita confirmación antes de reiniciar Ollama y agrega un drop-in separado, preservando el override actual `OLLAMA_HOST=127.0.0.1:11434`. `OLLAMA_MAX_LOADED_MODELS=1` permite a Ollama expulsar un modelo inactivo al cargar el otro; el coordinador no pide ese cambio hasta que la inferencia actual termina. `OLLAMA_NUM_PARALLEL=1` refuerza la configuración, pero el lock/dispatcher del coordinador proporciona la exclusión entre las dos fuentes AWS.
+
+Para actualizar manualmente solo el handler HTTP del coordinador instalado, después de copiar este checkout al host de Ollama:
+
+```bash
+sudo install -o ollama -g ollama -m 0640 \
+  ollama-coordinator/app/main.py \
+  /opt/ollama-inference-coordinator/app/main.py
+sudo systemctl restart ollama-inference-coordinator.service
+curl --fail http://127.0.0.1:11435/health
+sudo journalctl -u ollama-inference-coordinator.service -n 100 --no-pager
+```
+
+Este cambio no requiere recargar systemd, cambiar Apache, reinstalar dependencias ni reiniciar Ollama. El comando anterior se documenta para una actualización manual futura y no se ejecuta desde el repositorio.
+
+Para rollback del coordinador ejecuta `sudo ./ollama-coordinator/scripts/rollback.sh`; detiene solo ese servicio y conserva el código/configuración. Si configuraste Ollama, `sudo ./ollama-coordinator/scripts/rollback-ollama-limits.sh` elimina solo el drop-in de límites creado y reinicia Ollama, sin borrar otros overrides. Apache no se altera automáticamente: para rollback cambia manualmente el backend del VirtualHost de `127.0.0.1:11435` a `127.0.0.1:11434`, conserva TLS/Bearer, valida con `apache2ctl configtest` y recarga Apache.
 
 El endpoint multipart local/diagnóstico es `POST /process` con el campo `file`; las solicitudes viejas con `user_prompt` siguen siendo compatibles para trabajos ya persistidos, pero la interfaz nueva no envía preguntas durante la carga. `/health` no llama a Ollama. Los errores del proveedor se registran y `/process` contesta 502 sin stack trace.
 
@@ -160,17 +194,17 @@ Cada `POST /jobs` reserva un slot mediante una transacción DynamoDB que increme
 
 `POST /jobs/{job_id}/ask` acepta `{ "question": "..." }` y devuelve `202` con `ask_id`; el estado se consulta en `GET /jobs/{job_id}/asks/{ask_id}`. Ambas rutas usan el Cognito Authorizer existente. La identidad se toma del claim `sub`, el job debe pertenecer al usuario y estar `COMPLETED`, y el worker vuelve a verificarlo antes de leer el resultado y al persistir la respuesta. Un job de otro usuario o ya eliminado devuelve 404. No se acepta `user_id` del cliente.
 
-Las preguntas usan `QuestionQueue` y `QuestionDeadLetterQueue`, sin mezclar notificaciones S3. La Lambda de preguntas tiene concurrencia reservada de 1, un timeout de 900 segundos y un timeout máximo de lectura HTTP Ollama de 780 segundos; en ejecución el worker lo reduce si el tiempo restante de Lambda exige más margen para persistir el estado. API Gateway devuelve enseguida y no mantiene una conexión durante la inferencia. El event source mapping no fija `MaximumConcurrency`: AWS exige un mínimo de 2 para ese ajuste, mientras la concurrencia reservada de la función mantiene el máximo real de invocaciones en 1. Con más demanda, vigila throttles y edad del mensaje. Los fallos transitorios que el handler alcanza a capturar programan una visibilidad por mensaje con backoff (30, 60 segundos, limitada a 300); la visibilidad configurada de la cola sigue siendo 5.400 segundos para cubrir una ejecución Lambda completa. Un cierre abrupto no puede reducir esa visibilidad y puede tardar hasta 90 minutos en reintentarse. El token Ollama se obtiene en tiempo de ejecución desde el mismo secreto de Secrets Manager cuando `ProcessorDeployment=fargate`; no se envía al navegador ni se configura como texto plano. Para operar con `ProcessorDeployment=local`, la Lambda local no requiere token y `deploy-local.sh` apunta Ollama al host local.
+Las preguntas usan `QuestionQueue` y `QuestionDeadLetterQueue`, sin mezclar notificaciones S3. La Lambda tiene timeout de 900 segundos y lectura Ollama de hasta 780 segundos; calcula el tiempo disponible antes de cada inferencia para reservar margen para guardar el estado. API Gateway devuelve enseguida y no mantiene una conexión durante la inferencia. El event source mapping mantiene `BatchSize=1`, `MaximumConcurrency=2` y entrega parcial de fallos. Fallos transitorios normales usan backoff de 30–300 segundos; un `503 coordinator_busy` usa 900 segundos, conserva `PENDING/RETRYING` y evita reintentar mientras el modelo sigue ocupado. La visibilidad de cola sigue en 5.400 segundos. El token Bearer se obtiene de Secrets Manager; no se envía al navegador ni se guarda como parámetro SAM.
 
 Al exceder los tres receives, `QuestionDeadLetterQueue` activa una Lambda reconciliadora de mínimo privilegio. Esta marca `FAILED` consultas que aún estén `PENDING`/`PROCESSING`, sin tocar estados terminales ni consultas expiradas. Así se cubren también invocaciones terminadas por timeout o caída antes de actualizar DynamoDB. Si la reconciliación no puede actualizar DynamoDB por un fallo transitorio, devuelve ese mensaje como fallo parcial para reintentar desde la DLQ; además, el endpoint de estado convierte una consulta sin cambios durante 9 horas a `FAILED` de forma condicional. Los registros dejan de ser accesibles al cumplirse su TTL lógico de 24 horas, aunque DynamoDB elimine físicamente el item más tarde.
 
-Los parámetros SAM de esta función son `OllamaAskNumPredict=1000`, `OllamaAskReadTimeout=780`, `OllamaAskContextMaxChars=16000`, `QuestionQueueVisibilityTimeout=5400`, `QuestionRetryDelaySeconds=30` y `MaxUserQuestionsPerDay=50`. La Lambda no declara `VpcConfig`; por la configuración del código SAM no hereda el security group de Fargate. Una Lambda no conectada a una VPC tiene egreso público administrado por AWS, pero no una IP de salida fija. Por tanto la ruta pública HTTPS, DNS, firewall del host y Apache deben permitir la solicitud desde ese origen. El `OllamaIPv4Cidr` solo configura el egreso del security group de Fargate; no configura Apache ni el firewall del servidor. La configuración del repositorio no demuestra que la Lambda desplegada pueda conectarse; eso debe comprobarse en un despliegue controlado mirando categorías/status en CloudWatch y los logs de Apache, sin habilitar logging del token o del contenido.
+Los parámetros SAM de preguntas son `OllamaAskModel=qwen3-vl:8b-instruct`, `OllamaAskNumCtx=8192`, `OllamaAskNumPredict=2000`, `OllamaAskEvidenceNumPredict=300`, `OllamaAskReadTimeout=780`, `OllamaCoordinatorQueueWaitSeconds=120` y `OllamaCoordinatorRetryDelaySeconds=900`. La Lambda no declara `VpcConfig`; usa egreso público administrado por AWS y no tiene IP pública de salida fija. La configuración del repositorio no prueba conectividad desde una Lambda desplegada; debe verificarse posteriormente mediante logs de CloudWatch/Apache, sin registrar tokens ni contenido.
 
 TLS se verifica mediante el comportamiento predeterminado de `requests`; el cliente no desactiva la validación de certificados. El secreto se obtiene desde Secrets Manager en tiempo de ejecución y el header Bearer no se registra. `QuestionProcessorRole` solo lee `results/*`, el secreto exacto, las dos tablas y `QuestionQueue`; no tiene acceso al PDF original. El reconciliador separado solo lee/borra/renueva mensajes de la DLQ, actualiza `QuestionTable` y escribe en su log group.
 
-El resultado nuevo en `ResultsBucket` agrega `page_extractions` con transcripción, notas y elementos visuales de cada página, generados y validados durante el procesamiento inicial. Resultados históricos se leen sin migración: las versiones estructuradas se dividen usando los encabezados `--- Página N ---`; los resultados legacy usan `page_results`. Si no existen límites de página verificables, la respuesta no inventa una cita.
+El resultado nuevo en `ResultsBucket` agrega `page_extractions` con transcripción, notas y elementos visuales de cada página, generados y validados durante el procesamiento inicial. Las preguntas usan únicamente la transcripción original: resultados históricos con `transcription` y marcadores de página siguen siendo compatibles. Un resultado legacy que solo tenga `page_results`/análisis, sin transcripción original, falla de forma controlada y no se usa como sustituto del texto fuente.
 
-La recuperación inicial usa coincidencias léxicas por páginas/fragmentos, no embeddings. Conserva el resumen global y selecciona extractos completos hasta `OllamaAskContextMaxChars`; no recorta un extracto por la mitad. Si se omitió parte del documento, la API marca `context_limited` y la interfaz lo indica. La respuesta debe decir que no encontró la información cuando la evidencia enviada no basta. Esto reduce contexto, pero puede omitir un pasaje cuya redacción no coincida con la pregunta.
+La recuperación ya no usa coincidencias léxicas como filtro: la entrada principal es toda la transcripción por página y no se usa FinalSynthesis como reemplazo. En Ollama 0.40.2 no hay endpoint público de tokenización, así que antes de inferir se aplica una cota conservadora basada en bytes UTF-8 del prompt+schema, margen de plantilla y presupuesto de salida; no se igualan caracteres con tokens. Si el texto no cabe, se divide sin pérdida en hasta cuatro secciones; cada cita devuelta debe aparecer literalmente en la página fuente y la respuesta final solo puede citar páginas de esas citas. Resultados históricos sin límites verificables de página pueden responder sin citas si caben completos, pero no se dividen jerárquicamente. Los documentos mayores que ese límite terminan con `context_too_large` y un error visible, sin inferencia ni recorte silencioso.
 
 Las preguntas están limitadas a 2.000 caracteres y 50 por usuario al día, y sus registros (pregunta y respuesta) tienen TTL de un día. DynamoDB TTL es asíncrono; la API deja de exponer la consulta al vencer `expires_at`, y `DELETE /jobs/{job_id}` elimina explícitamente las consultas conocidas antes de borrar el job. El historial visual de preguntas/respuestas solo vive en el estado React y no se restaura al recargar. React deja de consultar después de 20 minutos para no dejar polling infinito; conserva `PENDING`/`PROCESSING` y ofrece **Revisar estado**, en lugar de afirmar que el backend terminó en `FAILED` por un timeout local.
 
@@ -180,25 +214,13 @@ La imagen ejecuta FastAPI y hasta dos consumidores SQS en la misma task ECS/Farg
 
 `ProcessorMaxConcurrentJobs` controla el máximo por task y admite `1` o `2`; el default sigue siendo `1` para que el aumento se active explícitamente. Con `DocumentProcessorDesiredCount=1` y `ProcessorMaxConcurrentJobs=2`, habrá como máximo dos jobs activos en la task. Si más adelante se eleva el desired count, la capacidad agregada será `desiredCount × ProcessorMaxConcurrentJobs`. El CPU/memoria de task se mantiene en 0.25 vCPU/1 GiB: como Ollama corre fuera de Fargate y se rasteriza una página por job a la vez, la memoria adicional esperada es principalmente hasta dos PDFs/imágenes en proceso; no se aumentó sin mediciones de carga concurrente. Conviene revisar métricas ECS después de activar los dos slots.
 
-El servidor local inspeccionado corre Ollama `0.40.2`; no tiene `OLLAMA_NUM_PARALLEL` configurado, cuyo default documentado es `1`. Por tanto, dos jobs Fargate enviarán solicitudes HTTP simultáneas, pero no se debe asumir que Ollama inferirá ambas a la vez. La documentación/código actual de Ollama indica que ciertas arquitecturas, incluida `qwen3vl`, pueden forzarse a un slot por limitaciones del modelo; además la memoria requerida escala con `OLLAMA_NUM_PARALLEL × OLLAMA_CONTEXT_LENGTH` ([FAQ de Ollama](https://github.com/ollama/ollama/blob/main/docs/faq.mdx), [programador de Ollama](https://github.com/ollama/ollama/blob/main/server/sched.go)). No recomendamos habilitarlo aún: la GTX 1070 tiene 8 GiB y el contexto está en 16.384; hay que verificar la memoria con el modelo cargado antes de probar dos slots.
-
-Para probar dos slots en el host Ollama solo después de validar memoria, añade el override sin reemplazar otros valores del servicio:
-
-```bash
-sudo systemctl edit ollama
-# En el editor, dentro de [Service]:
-# Environment="OLLAMA_NUM_PARALLEL=2"
-sudo systemctl daemon-reload
-sudo systemctl restart ollama
-```
-
-El override solo solicita el valor; no confirma dos slots efectivos para `qwen3-vl`. Antes de asumir concurrencia, revisa el journal por el aviso `model architecture does not currently support parallel requests` y observa el runner con `ollama ps` durante una prueba controlada posterior. Para revertir, vuelve a `sudo systemctl edit ollama`, elimina únicamente la línea de `OLLAMA_NUM_PARALLEL` agregada, conserva `OLLAMA_HOST=127.0.0.1:11434` y cualquier otro override existente, luego ejecuta los mismos `daemon-reload` y `restart`. No uses `systemctl revert`, porque podría eliminar overrides ajenos a este cambio.
+El host local inspeccionado corre Ollama `0.40.2` y tiene ambos modelos instalados. No se detectó configuración explícita de `OLLAMA_MAX_LOADED_MODELS` ni `OLLAMA_NUM_PARALLEL`; el checkout no cargó un modelo para medir VRAM. La configuración preparada crea un proceso Uvicorn con lock exclusivo, `OLLAMA_MAX_LOADED_MODELS=1` y `OLLAMA_NUM_PARALLEL=1`. La coordinación antes de Ollama es la garantía principal; el límite de Ollama es una defensa adicional. La GTX 1070 tiene 8 GiB; el tamaño descargado no equivale a VRAM residente. Después de instalar, confirma con `systemctl show ollama -p Environment`, `ollama ps` y `nvidia-smi`. El script `apply-ollama-limits.sh` exige escribir `RESTART OLLAMA` antes de instalar el drop-in y reiniciar el servicio.
 
 En SIGTERM, el worker deja de long-pollear y espera hasta 45 segundos para que sus consumidores terminen ordenadamente, dentro del `StopTimeout=60` de ECS. Durante esa espera los jobs activos conservan heartbeat y lease. Si una inferencia tarda más, la task puede terminar antes de completar: no confirma el mensaje, conserva checkpoints ya confirmados y SQS lo vuelve a entregar cuando vence la visibilidad; la nueva task reanuda desde checkpoints. Un mensaje recibido justo al comenzar el apagado tampoco se procesa ni se confirma y puede permanecer invisible hasta vencer su ventana de visibilidad.
 
 La task Fargate está preparada en una subnet pública con asignación de IP pública y ruta al Internet Gateway para descargar la imagen de ECR, enviar logs, hacer long polling de SQS y llamar al proxy HTTPS de Ollama. AWS requiere una IP pública en la task para el egress directo por IGW; la Lambda no recibe IP pública por estar en la subnet pública ([networking Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/fargate-task-networking.html), [IGW y direcciones públicas](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_Internet_Gateway.html)). La IP pública no implica que el puerto 8000 quede abierto: no hay ingress público. El security group mantiene TCP 11443 únicamente a `OllamaIPv4Cidr` (`99.35.202.200/32`). La regla separada TCP 443 a `0.0.0.0/0` permite a Fargate alcanzar SQS y los endpoints públicos de ECR, CloudWatch Logs y Secrets Manager; no abre el puerto Ollama a Internet. S3 y DynamoDB usan los endpoints gateway existentes. No se crea NAT Gateway ni ALB. La DNS privada de Cloud Map apunta a la IP privada de la task ([service discovery](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service-discovery.html)). Se usa una sola subnet/AZ y una task por costo; esto no ofrece alta disponibilidad ante la caída de esa AZ.
 
-`ProcessorDeployment=fargate` es el valor AWS predeterminado. `deploy-local.sh` lo cambia a `local` y continúa usando `DocumentProcessorUrl`; ese modo omite ECR, ECS y VPC, preservando LocalStack y Compose. En local, Compose sigue publicando processor en 8000 y apunta a Ollama del host por 11434. La autenticación Cognito sigue sin bypass y requiere AWS real con la licencia LocalStack actual.
+`ProcessorDeployment=fargate` es el valor AWS predeterminado. `deploy-local.sh` lo cambia a `local` y continúa usando `DocumentProcessorUrl`; ese modo omite ECR, ECS y VPC, preservando LocalStack y Compose. En local, Compose publica processor en 8000 y apunta al coordinador del host por 11435. La autenticación Cognito sigue sin bypass y requiere AWS real con la licencia LocalStack actual.
 
 El servicio ECS inicia con `DocumentProcessorDesiredCount=0`. El primer despliegue crea el repositorio y la infraestructura; después se construye y sube la imagen; por último se actualiza a `1`. Esto evita intentar iniciar una imagen que todavía no existe en ECR.
 
@@ -215,9 +237,9 @@ Parámetros principales: `OllamaBaseUrl` (`https://la-ea.duckdns.org:11443`, end
 
 ### Proxy remoto de Ollama: TLS y Bearer token
 
-`document-processor` usa el cliente `requests` existente para `POST /api/chat` con `OLLAMA_BASE_URL=https://la-ea.duckdns.org:11443`. Requests mantiene habilitada su verificación TLS normal; no se configura `verify=False` ni CA personalizada. Si `OLLAMA_API_TOKEN` no está definida o está vacía (Compose local), no manda Authorization; cuando está presente, envía `Authorization: Bearer …`. Los logs y las excepciones del cliente no registran el header, el valor del token ni el texto de los errores HTTP. La petición actual usa `stream=false`; Apache proxya la respuesta normal de Ollama y el timeout permite respuestas largas. No se ha activado streaming en el cliente.
+`document-processor` y la Lambda de preguntas usan `requests` para `POST /api/chat` con `OLLAMA_BASE_URL=https://la-ea.duckdns.org:11443`. Requests mantiene la verificación TLS predeterminada. Los clientes envían Bearer cuando tienen token; no se registra el header ni su valor. Ambos usan `stream=false`. Apache termina TLS/autorización y reenvía a `127.0.0.1:11435`; el coordinador elimina credenciales antes de llamar a Ollama en `127.0.0.1:11434`.
 
-El endpoint real, ya configurado y probado fuera del repositorio, sigue la ruta `https://la-ea.duckdns.org:11443` → Apache/TLS/Bearer → `http://127.0.0.1:11434`. Las pruebas externas confirmaron HTTP 403 sin token o con token incorrecto, y HTTP 200 con el token correcto. La referencia Apache versionada está en [`infrastructure/apache/ollama-proxy.conf.example`](infrastructure/apache/ollama-proxy.conf.example); no contiene secretos ni certificados privados. La configuración del host, Apache y Ollama queda fuera del despliegue de este repositorio.
+La ruta preparada es `https://la-ea.duckdns.org:11443` → Apache/TLS/Bearer → coordinador `127.0.0.1:11435` → Ollama `127.0.0.1:11434`. El checkout no demuestra que Apache productivo haya sido cambiado; su ejemplo versionado es [`infrastructure/apache/ollama-proxy.conf.example`](infrastructure/apache/ollama-proxy.conf.example). No se cambia Apache ni systemd automáticamente desde AWS.
 
 Ollama permanece escuchando exclusivamente en `127.0.0.1:11434`; AWS no conecta directamente a ese puerto. En el router, el acceso público TCP 11443 termina en Apache y no debe existir un forward público al 11434. Apache, Ollama, el router y UFW no son modificados por este repositorio.
 
@@ -225,87 +247,27 @@ El DNS `la-ea.duckdns.org` y el certificado público de Let's Encrypt ya están 
 
 La Task Definition obtiene `OLLAMA_API_TOKEN` del recurso Secrets Manager referenciado por `ValueFrom`; no es una variable de entorno plaintext en CloudFormation. El único permiso para leerlo es `secretsmanager:GetSecretValue` sobre el ARN exacto y corresponde al task execution role. Después del primer despliegue con desired count 0, carga manualmente el token ya existente en el secreto mediante la consola de Secrets Manager antes de iniciar tasks. No se genera otro token ni se incluye su valor en el repositorio o en comandos. ECS inyecta el secreto al iniciar cada task; tras una rotación hay que reiniciar/desplegar tasks ([documentación ECS](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html)).
 
-### Comandos para despliegue posterior
+### Publicación posterior
 
-No ejecutar durante esta iteración. Cuando autorices el despliegue, primero autentica el CLI con IAM Identity Center:
+Esta iteración no publica ni despliega nada. Cuando se autorice el release, sigue la skill [`aws-deploy`](.agents/skills/aws-deploy/SKILL.md), que valida la identidad/cuenta antes de escrituras y conserva los parámetros actuales de CloudFormation.
 
-```bash
-aws configure sso --profile document-ai-ohio
-aws sso login --profile document-ai-ohio
-export AWS_PROFILE=document-ai-ohio
-export AWS_REGION=us-east-2
-aws sts get-caller-identity
-```
+Antes de actualizar las Lambdas/Fargate, instala manualmente el coordinador en el host Ollama y cambia el VirtualHost Apache para que `/api/chat` apunte a `127.0.0.1:11435`, manteniendo TLS/Bearer. Ejecuta `apache2ctl configtest` y recarga Apache según las instrucciones de instalación anteriores. Sin ese cambio manual, la URL pública seguirá llegando al Ollama directo y no serializará los dos modelos.
 
-Construye y despliega SAM con el servicio ECS en cero. Ejecuta el ensamblador antes de cada build si cambias los módulos:
+Como cambió `document-processor/`, usa el flujo completo Docker → ECR → SAM → ECS:
 
 ```bash
-python3 infrastructure/aws/assemble_template.py
-sam build --template-file infrastructure/aws/.template-assembled.yml
-sam deploy \
-  --template-file .aws-sam/build/template.yaml \
-  --config-file infrastructure/aws/samconfig.toml \
-  --parameter-overrides \
-    Environment=dev ProcessorDeployment=fargate DocumentProcessorDesiredCount=0 \
-    OllamaModel=qwen3-vl:8b-instruct \
-    OllamaBaseUrl=https://la-ea.duckdns.org:11443 OllamaIPv4Cidr=99.35.202.200/32 \
-    QueueVisibilityTimeout=900 FrontendOrigin=https://dfw9n3vcykvho.cloudfront.net
+.agents/skills/aws-deploy/scripts/deploy-processor.sh --deploy
 ```
 
-Obtén el URI de ECR, autentica Docker y sube la imagen construida desde el Dockerfile existente:
+El script construye una sola imagen `linux/amd64`, obtiene el tag desde esa publicación, crea/revisa el changeset SAM y espera estabilidad/health ECS. No uses `sam deploy` solo para una imagen nueva ni `aws ecs update-service`. La Lambda de preguntas y los cambios SAM se actualizan en ese mismo despliegue; `DocumentProcessorImageTag` y los demás parámetros se conservan, excepto que `OllamaAskModel` se establece explícitamente a `qwen3-vl:8b-instruct` (puede cambiarse con `--parameter OllamaAskModel=...`).
+
+Como también cambió React, publica el frontend por separado cuando esté autorizado:
 
 ```bash
-ECR_URI=$(aws cloudformation describe-stacks \
-  --stack-name document-ai-pipeline \
-  --query "Stacks[0].Outputs[?OutputKey=='DocumentProcessorRepositoryUri'].OutputValue" \
-  --output text)
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin "${ECR_URI%%/*}"
-docker build --platform linux/amd64 -t "$ECR_URI:latest" \
-  -f document-processor/Dockerfile document-processor
-docker push "$ECR_URI:latest"
+.agents/skills/aws-deploy/scripts/deploy-frontend.sh
 ```
 
-Vuelve a desplegar conservando los mismos overrides y estableciendo `DocumentProcessorDesiredCount=1`:
-
-```bash
-sam deploy \
-  --template-file .aws-sam/build/template.yaml \
-  --config-file infrastructure/aws/samconfig.toml \
-  --parameter-overrides \
-    Environment=dev ProcessorDeployment=fargate DocumentProcessorDesiredCount=1 \
-    OllamaModel=qwen3-vl:8b-instruct \
-    OllamaBaseUrl=https://la-ea.duckdns.org:11443 OllamaIPv4Cidr=99.35.202.200/32 \
-    QueueVisibilityTimeout=900 FrontendOrigin=https://dfw9n3vcykvho.cloudfront.net
-```
-
-Para cada versión posterior de la imagen, usa un tag nuevo, súbelo a ECR y pasa ese valor como `DocumentProcessorImageTag` en el despliegue para registrar una nueva revisión de Task Definition. Luego revisa Outputs y estado ECS:
-
-```bash
-aws cloudformation describe-stacks --stack-name document-ai-pipeline \
-  --query 'Stacks[0].Outputs' --output table
-CLUSTER_NAME=$(aws cloudformation describe-stacks --stack-name document-ai-pipeline \
-  --query "Stacks[0].Outputs[?OutputKey=='DocumentProcessorClusterName'].OutputValue" \
-  --output text)
-SERVICE_NAME=$(aws cloudformation describe-stacks --stack-name document-ai-pipeline \
-  --query "Stacks[0].Outputs[?OutputKey=='DocumentProcessorServiceName'].OutputValue" \
-  --output text)
-aws ecs describe-services --cluster "$CLUSTER_NAME" \
-  --services "$SERVICE_NAME" --query 'services[0].deployments'
-```
-
-Finalmente configura `JobsApiUrl`, `CognitoUserPoolId` y `CognitoUserPoolClientId` en `frontend/.env.local` como `VITE_API_BASE_URL`, `VITE_COGNITO_USER_POOL_ID` y `VITE_COGNITO_USER_POOL_CLIENT_ID`. No configures `VITE_COGNITO_ENDPOINT` al usar AWS.
-
-Pruebas unitarias de API/worker:
-
-```bash
-cd worker
-python3 -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest
-```
-
-LocalStack usa cinco pollers para SQS Standard por defecto. Mientras Lambda ejecuta A con concurrencia reservada `1`, los demás pollers pueden recibir B/C, ser throttled y dejar temporalmente esos mensajes invisibles durante el visibility timeout. El perfil local limita el event source mapping a un poller, por lo que los mensajes posteriores permanecen visibles esperando turno. Este ajuste afecta solo al emulador; no cambia la concurrencia de Lambda ni la arquitectura AWS. En AWS, Lambda/SQS conserva los mensajes tras throttling y los reintenta según visibilidad y backoff del event source mapping.
+Este comando ejecuta Vite, sincroniza `frontend/dist/` con S3 e invalida CloudFront después de confirmación. No se ejecutó ninguno de estos comandos durante esta tarea.
 
 ## Pruebas
 
@@ -321,14 +283,14 @@ python3 -m venv .venv
 La suite verifica `/health`, PDF de una y varias páginas, contexto secuencial, `user_prompt` vacío/definido, error Ollama, PDF inválido, tamaño máximo y estructura final. Prueba el cliente Ollama manualmente con:
 
 ```bash
-curl http://localhost:11434/api/chat \
+curl http://localhost:11435/api/chat \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen3-vl:8b-instruct","stream":false,"messages":[{"role":"user","content":"Responde en español: ¿estás disponible?"}]}'
 ```
 
 ## Prueba end-to-end
 
-1. Levanta Ollama, descarga el modelo y arranca `docker compose up --build -d`.
+1. Instala el coordinador en el host Ollama, configura Apache para el backend loopback `127.0.0.1:11435` conservando TLS/Bearer, y arranca `docker compose up --build -d`.
 2. En LocalStack usa `bash infrastructure/aws/deploy-local.sh` y el processor local; en AWS sigue los pasos de “Comandos para despliegue posterior”.
 3. Copia `JobsApiUrl`, `CognitoUserPoolId` y `CognitoUserPoolClientId` desde los outputs del stack a `frontend/.env.local` con los nombres `VITE_API_BASE_URL`, `VITE_COGNITO_USER_POOL_ID` y `VITE_COGNITO_USER_POOL_CLIENT_ID`; reinicia Vite.
 4. Registra una cuenta, confirma el código enviado por Cognito e inicia sesión.

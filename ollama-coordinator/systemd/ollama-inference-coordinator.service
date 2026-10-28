@@ -1,0 +1,29 @@
+[Unit]
+Description=Single-inference Ollama request coordinator
+After=network-online.target ollama.service
+Requires=ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+WorkingDirectory=/opt/ollama-inference-coordinator
+EnvironmentFile=/etc/ollama-inference-coordinator.env
+Environment=OLLAMA_COORDINATOR_LOCK_PATH=/run/ollama-inference-coordinator/coordinator.lock
+RuntimeDirectory=ollama-inference-coordinator
+RuntimeDirectoryMode=0750
+ExecStart=/opt/ollama-inference-coordinator/.venv/bin/python -m app.serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/ollama-inference-coordinator
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

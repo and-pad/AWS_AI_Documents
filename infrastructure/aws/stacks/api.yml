@@ -143,6 +143,7 @@
                 - dynamodb:UpdateItem
                 - dynamodb:DeleteItem
                 - dynamodb:TransactWriteItems
+                - dynamodb:ConditionCheckItem
               Resource: !GetAtt JobsTable.Arn
             - Effect: Allow
               Action:
@@ -152,6 +153,7 @@
             - Effect: Allow
               Action:
                 - dynamodb:GetItem
+                - dynamodb:PutItem
                 - dynamodb:UpdateItem
                 - dynamodb:DeleteItem
                 - dynamodb:Query
@@ -283,6 +285,11 @@
                 Resource:
                   - !GetAtt JobsTable.Arn
                   - !GetAtt QuestionTable.Arn
+              # TransactWriteItems authorizes each transaction item action.
+              # The completion transaction condition-checks the parent job.
+              - Effect: Allow
+                Action: dynamodb:ConditionCheckItem
+                Resource: !GetAtt JobsTable.Arn
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub "${ResultsBucket.Arn}/results/*"
@@ -321,7 +328,6 @@
       Role: !GetAtt QuestionProcessorRole.Arn
       Timeout: 900
       MemorySize: 512
-      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           JOBS_TABLE: !Ref JobsTable
@@ -329,11 +335,13 @@
           QUESTION_QUEUE_URL: !Ref QuestionQueue
           RESULTS_BUCKET: !Ref ResultsBucket
           OLLAMA_BASE_URL: !Ref OllamaBaseUrl
-          OLLAMA_MODEL: !Ref OllamaModel
-          OLLAMA_NUM_CTX: !Ref OllamaNumCtx
+          OLLAMA_ASK_MODEL: !Ref OllamaAskModel
+          OLLAMA_ASK_NUM_CTX: !Ref OllamaAskNumCtx
           OLLAMA_ASK_NUM_PREDICT: !Ref OllamaAskNumPredict
+          OLLAMA_ASK_EVIDENCE_NUM_PREDICT: !Ref OllamaAskEvidenceNumPredict
           OLLAMA_ASK_READ_TIMEOUT: !Ref OllamaAskReadTimeout
-          OLLAMA_ASK_CONTEXT_MAX_CHARS: !Ref OllamaAskContextMaxChars
+          OLLAMA_ASK_QUEUE_WAIT_SECONDS: !Ref OllamaCoordinatorQueueWaitSeconds
+          OLLAMA_COORDINATOR_RETRY_DELAY_SECONDS: !Ref OllamaCoordinatorRetryDelaySeconds
           OLLAMA_API_TOKEN_SECRET_ARN: !If [DeployProcessorOnFargate, !Ref OllamaApiTokenSecret, '']
           QUESTION_RETRY_DELAY_SECONDS: !Ref QuestionRetryDelaySeconds
           SQS_MAX_RECEIVE_COUNT: '3'
@@ -344,6 +352,8 @@
           Properties:
             Queue: !GetAtt QuestionQueue.Arn
             BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 2
             FunctionResponseTypes:
               - ReportBatchItemFailures
 
@@ -395,7 +405,6 @@
       Role: !GetAtt QuestionDlqReconcilerRole.Arn
       Timeout: 30
       MemorySize: 128
-      ReservedConcurrentExecutions: 1
       Environment:
         Variables:
           QUESTION_TABLE: !Ref QuestionTable
@@ -406,5 +415,7 @@
           Properties:
             Queue: !GetAtt QuestionDeadLetterQueue.Arn
             BatchSize: 1
+            ScalingConfig:
+              MaximumConcurrency: 2
             FunctionResponseTypes:
               - ReportBatchItemFailures

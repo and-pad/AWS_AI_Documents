@@ -30,7 +30,9 @@ import { bearerToken } from './auth'
 
 const apiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '')
 const MAX_QUESTION_LENGTH = 2000
-const MAX_QUESTION_POLL_MS = 20 * 60 * 1000
+// Queue wait plus a slow model invocation can exceed the old 20-minute cap.
+// Keep polling bounded, then retain the ask id and offer an explicit resume.
+const MAX_QUESTION_POLL_MS = 60 * 60 * 1000
 const QUESTION_STATUS_TIMEOUT_MS = 15000
 const QUESTION_CREATE_TIMEOUT_MS = 25000
 
@@ -256,11 +258,33 @@ type AskEntry = {
   id: string
   question: string
   status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED'
+  processing_stage?: string
+  error_code?: string
   answer?: string
   source_pages?: number[]
   context_limited?: boolean
+  context_mode?: string
+  model?: string
   error?: string
   polling_paused?: boolean
+}
+
+export function questionStageLabel(entry: Pick<AskEntry, 'status' | 'processing_stage'>): string {
+  if (entry.status === 'PENDING') {
+    return entry.processing_stage === 'RETRYING'
+      ? 'Ocurrió un error temporal. Se intentará nuevamente.'
+      : 'Pregunta recibida. Esperando turno en la cola.'
+  }
+  if (entry.status === 'PROCESSING') {
+    switch (entry.processing_stage) {
+      case 'LOADING_CONTEXT': return 'Preparando información del documento.'
+      case 'WAITING_MODEL': return 'Esperando respuesta de la IA (puede estar en cola o procesando).'
+      case 'SAVING_RESULT': return 'Guardando respuesta.'
+      default: return 'Procesando consulta.'
+    }
+  }
+  if (entry.status === 'COMPLETED') return 'Respuesta lista.'
+  return 'No se pudo procesar la pregunta.'
 }
 
 function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
@@ -296,9 +320,12 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
       ? { ...entry, polling_paused: false, error: undefined }
       : entry))
     const deadline = Date.now() + MAX_QUESTION_POLL_MS
+    let pollCount = 0
     try {
       while (Date.now() < deadline && !controller.signal.aborted) {
-        await waitForNextPoll(2500, controller.signal)
+        const pollDelay = Math.min(15000, 2500 * (2 ** Math.min(pollCount, 3)))
+        await waitForNextPoll(pollDelay, controller.signal)
+        pollCount += 1
         const statusToken = await bearerToken()
         const statusResponse = await fetchQuestionRequest(
           `${apiBase}/jobs/${encodeURIComponent(jobId)}/asks/${encodeURIComponent(askId)}`,
@@ -313,6 +340,12 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
         }
         if (!statusResponse.ok) throw new Error(await apiError(statusResponse))
         const update: AskEntry = await statusResponse.json()
+        if (update.status === 'COMPLETED' && typeof update.answer !== 'string') {
+          setEntries((current) => current.map((entry) => entry.id === entryId
+            ? { ...entry, polling_paused: true, error: 'La consulta figura como lista, pero la respuesta todavía no está disponible. Puedes revisar el estado nuevamente.' }
+            : entry))
+          return
+        }
         setEntries((current) => current.map((entry) => entry.id === entryId ? { ...entry, ...update, polling_paused: false } : entry))
         if (update.status === 'COMPLETED' || update.status === 'FAILED') return
       }
@@ -353,6 +386,7 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
     const controller = new AbortController()
     const requestKey = `create-${Date.now()}-${Math.random()}`
     activeRequests.current.set(requestKey, controller)
+    let accepted = false
     setSending(true)
     setError('')
     try {
@@ -363,19 +397,24 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
         body: JSON.stringify({ question: submittedQuestion }),
       }, controller.signal, QUESTION_CREATE_TIMEOUT_MS)
       if (!createResponse.ok) throw new Error(await apiError(createResponse))
-      const created: { job_id: string; ask_id: string; status: AskEntry['status'] } = await createResponse.json()
+      const created: { job_id: string; ask_id: string; status: AskEntry['status']; processing_stage?: string } = await createResponse.json()
       const entryId = created.ask_id
       // Defend against an API response that does not match this card's document.
       if (created.job_id !== jobId || !created.ask_id) throw new Error('La API devolvió una consulta incompatible con este documento.')
-      setEntries((current) => [{ id: entryId, question: submittedQuestion, status: created.status }, ...current])
+      accepted = true
+      setEntries((current) => [{
+        id: entryId, question: submittedQuestion, status: created.status,
+        processing_stage: created.processing_stage || 'QUEUED',
+      }, ...current])
       setQuestion('')
+      setSending(false)
       await pollQuestion(entryId, created.ask_id, controller, requestKey)
     } catch (caught) {
       if (controller.signal.aborted) return
       const message = caught instanceof Error ? caught.message : 'No se pudo consultar el documento.'
       setError(message)
     } finally {
-      if (!controller.signal.aborted) setSending(false)
+      if (!controller.signal.aborted && !accepted) setSending(false)
       if (activeRequests.current.get(requestKey) === controller) activeRequests.current.delete(requestKey)
     }
   }
@@ -407,7 +446,7 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
               helperText={`${question.length} / ${MAX_QUESTION_LENGTH}`}
             />
             <Button type="submit" variant="contained" disabled={disabled || sending || !question.trim()}>
-              {sending ? <><CircularProgress size={18} sx={{ mr: 1 }} /> Consultando…</> : 'Preguntar'}
+              {sending ? <><CircularProgress size={18} sx={{ mr: 1 }} /> Enviando pregunta…</> : 'Preguntar'}
             </Button>
           </Stack>
         </Box>
@@ -421,7 +460,7 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
               <Stack spacing={1}>
                 <Stack direction="row" spacing={1} role="status" sx={{ alignItems: 'center' }}>
                   {pollingIds.has(entry.id) && <CircularProgress size={16} />}
-                  <Typography variant="body2" color="text.secondary">{entry.status === 'PENDING' ? 'En espera' : 'Buscando en el documento…'}</Typography>
+                  <Typography variant="body2" color="text.secondary">{questionStageLabel(entry)}</Typography>
                 </Stack>
                 {entry.polling_paused && <Alert severity="info" action={
                   <Button color="inherit" size="small" disabled={pollingIds.has(entry.id)} onClick={() => resumePolling(entry)}>
@@ -431,18 +470,23 @@ function AskSection({ jobId, disabled }: { jobId: string; disabled: boolean }) {
               </Stack>
             )}
             {entry.status === 'COMPLETED' && <>
-              <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 0.75 }}>Respuesta</Typography>
+              <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 0.75 }}>{questionStageLabel(entry)}</Typography>
+              {entry.model === 'deepseek-r1:8b' && (
+                <Typography variant="caption" color="text.secondary" sx={{ mb: 0.75, display: 'block' }}>
+                  Respuesta generada con DeepSeek-R1.
+                </Typography>
+              )}
               <Typography sx={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', lineHeight: 1.7 }}>{entry.answer}</Typography>
               {!!entry.source_pages?.length && (
                 <Stack direction="row" spacing={0.75} sx={{ mt: 1.25, flexWrap: 'wrap', gap: 0.75 }}>
                   {entry.source_pages.map((page) => <Chip key={page} size="small" variant="outlined" label={`Página ${page}`} />)}
                 </Stack>
               )}
-              {entry.context_limited && <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
-                Se consultaron fragmentos seleccionados; la respuesta puede no incluir información fuera de ellos.
+              {entry.context_mode === 'HIERARCHICAL_FULL_TRANSCRIPT' && <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                La transcripción completa se revisó por secciones para respetar el límite de contexto.
               </Typography>}
             </>}
-            {entry.status === 'FAILED' && <Alert severity="error">{entry.error || 'No se pudo responder la pregunta.'}</Alert>}
+            {entry.status === 'FAILED' && <Alert severity="error">{entry.error || questionStageLabel(entry)}</Alert>}
           </Paper>
         ))}
       </Stack>

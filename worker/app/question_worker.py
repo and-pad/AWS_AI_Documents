@@ -14,7 +14,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from app.ollama_qa_client import QuestionModelError, ask_ollama
-from app.qa_service import IncompatibleDocumentResult, build_question_context
+from app.qa_service import IncompatibleDocumentResult, QuestionContextTooLarge, build_question_context
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -139,7 +139,7 @@ def _claim_ask(question_table, job_id: str, ask_id: str, processing_owner: str) 
         response = question_table.update_item(
             Key={"job_id": job_id, "ask_id": ask_id},
             UpdateExpression=(
-                "SET #status = :processing, processing_owner = :owner, "
+                "SET #status = :processing, #stage = :stage, processing_owner = :owner, "
                 "processing_lease_until = :lease, updated_at = :updated, "
                 "processing_attempt = if_not_exists(processing_attempt, :zero) + :one"
             ),
@@ -147,9 +147,10 @@ def _claim_ask(question_table, job_id: str, ask_id: str, processing_owner: str) 
                 "attribute_exists(ask_id) AND expires_at > :now AND "
                 "(#status = :pending OR (#status = :processing AND processing_lease_until < :now))"
             ),
-            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage"},
             ExpressionAttributeValues={
                 ":processing": "PROCESSING",
+                ":stage": "LOADING_CONTEXT",
                 ":pending": "PENDING",
                 ":owner": processing_owner,
                 ":lease": now + int(os.getenv("ASK_PROCESSING_LEASE_SECONDS", "960")),
@@ -174,6 +175,33 @@ def _claim_ask(question_table, job_id: str, ask_id: str, processing_owner: str) 
         return None
 
 
+def _set_processing_stage(question_table, job_id: str, ask_id: str, owner: str, stage: str) -> bool:
+    """Update a visible stage only while this invocation still owns a live lease."""
+    try:
+        question_table.update_item(
+            Key={"job_id": job_id, "ask_id": ask_id},
+            UpdateExpression="SET #stage = :stage, updated_at = :updated",
+            ConditionExpression=(
+                "#status = :processing AND processing_owner = :owner "
+                "AND processing_lease_until > :now AND attribute_exists(ask_id)"
+            ),
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage"},
+            ExpressionAttributeValues={
+                ":stage": stage, ":updated": _now_iso(), ":processing": "PROCESSING",
+                ":owner": owner, ":now": int(time.time()),
+            },
+        )
+        logger.info("ASK_STAGE_CHANGED job_id=%s ask_id=%s processing_owner=%s processing_stage=%s",
+                    job_id, ask_id, owner, stage)
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            logger.info("ASK_STAGE_UPDATE_SKIPPED job_id=%s ask_id=%s processing_owner=%s processing_stage=%s reason=lease_not_owned",
+                        job_id, ask_id, owner, stage)
+            return False
+        raise
+
+
 def _load_completed_job(job_id: str, user_id: str) -> dict | None:
     item = _table("JOBS_TABLE").get_item(Key={"job_id": job_id}, ConsistentRead=True).get("Item")
     if not item or item.get("user_id") != user_id or item.get("status") != "COMPLETED":
@@ -196,6 +224,17 @@ def _load_result(bucket: str, key: str) -> dict:
 def _complete_ask(question_table, job_id: str, ask_id: str, user_id: str, owner: str,
                   answer: dict, context_limited: bool) -> bool:
     now = _now_iso()
+    model_set = ", #model = :model" if isinstance(answer.get("model"), str) and answer["model"] else ""
+    values = {
+        ":completed": "COMPLETED", ":processing": "PROCESSING", ":worker": owner,
+        ":answer": answer["answer"], ":pages": answer["source_pages"], ":limited": context_limited,
+        ":stage": "COMPLETED", ":now": now,
+        ":context_mode": answer.get("context_mode", "FULL_TRANSCRIPT"),
+    }
+    expression_names = {"#status": "status", "#stage": "processing_stage"}
+    if model_set:
+        values[":model"] = answer["model"]
+        expression_names["#model"] = "model"
     try:
         dynamodb.meta.client.transact_write_items(TransactItems=[
             {
@@ -213,16 +252,14 @@ def _complete_ask(question_table, job_id: str, ask_id: str, user_id: str, owner:
                     "Key": {"job_id": job_id, "ask_id": ask_id},
                     "UpdateExpression": (
                         "SET #status = :completed, answer = :answer, source_pages = :pages, "
-                        "context_limited = :limited, completed_at = :now, updated_at = :now "
+                        "context_limited = :limited, context_mode = :context_mode"
+                        + model_set
+                        + ", #stage = :stage, completed_at = :now, updated_at = :now "
                         "REMOVE processing_owner, processing_lease_until"
                     ),
                     "ConditionExpression": "#status = :processing AND processing_owner = :worker AND attribute_exists(ask_id)",
-                    "ExpressionAttributeNames": {"#status": "status"},
-                    "ExpressionAttributeValues": {
-                        ":completed": "COMPLETED", ":processing": "PROCESSING", ":worker": owner,
-                        ":answer": answer["answer"], ":pages": answer["source_pages"],
-                        ":limited": context_limited, ":now": now,
-                    },
+                    "ExpressionAttributeNames": expression_names,
+                    "ExpressionAttributeValues": values,
                 }
             },
         ])
@@ -242,14 +279,15 @@ def _set_terminal_error(question_table, job_id: str, ask_id: str, owner: str, me
         question_table.update_item(
             Key={"job_id": job_id, "ask_id": ask_id},
             UpdateExpression=(
-                "SET #status = :failed, error = :error, error_category = :category, "
+                "SET #status = :failed, #stage = :stage, #error = :error, error_category = :category, "
                 "failed_at = :now, updated_at = :now "
                 "REMOVE processing_owner, processing_lease_until"
             ),
             ConditionExpression="#status = :processing AND processing_owner = :owner AND attribute_exists(ask_id)",
-            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage", "#error": "error"},
             ExpressionAttributeValues={
                 ":failed": "FAILED", ":processing": "PROCESSING", ":owner": owner,
+                ":stage": "FAILED",
                 ":error": message, ":now": _now_iso(),
                 ":category": error_category,
             },
@@ -265,11 +303,11 @@ def _release_for_retry(question_table, job_id: str, ask_id: str, owner: str) -> 
     try:
         question_table.update_item(
             Key={"job_id": job_id, "ask_id": ask_id},
-            UpdateExpression="SET #status = :pending, updated_at = :now REMOVE processing_owner, processing_lease_until",
+            UpdateExpression="SET #status = :pending, #stage = :stage, updated_at = :now REMOVE processing_owner, processing_lease_until",
             ConditionExpression="#status = :processing AND processing_owner = :owner AND attribute_exists(ask_id)",
-            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage"},
             ExpressionAttributeValues={
-                ":pending": "PENDING", ":processing": "PROCESSING", ":owner": owner, ":now": _now_iso(),
+                ":pending": "PENDING", ":stage": "RETRYING", ":processing": "PROCESSING", ":owner": owner, ":now": _now_iso(),
             },
         )
         return True
@@ -298,7 +336,13 @@ def _change_visibility(record: dict, visibility_seconds: int, job_id: str, ask_i
                        job_id, ask_id, type(exc).__name__)
 
 
-def _retry_delay(receive_count: int) -> int:
+def _retry_delay(receive_count: int, error: QuestionModelError | None = None) -> int:
+    if error and error.category in {
+        "coordinator_busy", "coordinator_unavailable", "coordinator_shutdown", "coordinator_request_timeout",
+    }:
+        configured = int(os.getenv("OLLAMA_COORDINATOR_RETRY_DELAY_SECONDS", "900"))
+        suggested = error.retry_after_seconds or 0
+        return min(5400, max(1, configured, suggested))
     base = max(1, int(os.getenv("QUESTION_RETRY_DELAY_SECONDS", "30")))
     return min(base * max(1, receive_count), 300)
 
@@ -349,7 +393,7 @@ def _process_dlq_message(record: dict) -> bool:
         table.update_item(
             Key={"job_id": job_id, "ask_id": ask_id},
             UpdateExpression=(
-                "SET #status = :failed, error = :error, error_category = :category, "
+                "SET #status = :failed, #stage = :stage, #error = :error, error_category = :category, "
                 "failed_at = :now_iso, updated_at = :now_iso "
                 "REMOVE processing_owner, processing_lease_until"
             ),
@@ -358,9 +402,10 @@ def _process_dlq_message(record: dict) -> bool:
                 "(#status = :pending OR (#status = :processing AND "
                 "(attribute_not_exists(processing_lease_until) OR processing_lease_until <= :now)))"
             ),
-            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeNames={"#status": "status", "#stage": "processing_stage", "#error": "error"},
             ExpressionAttributeValues={
                 ":failed": "FAILED",
+                ":stage": "FAILED",
                 ":error": "No se pudo completar la consulta después de los reintentos permitidos.",
                 ":category": "retry_exhausted",
                 ":now_iso": _now_iso(),
@@ -444,19 +489,32 @@ def _process_message(record: dict, lambda_context=None) -> bool:
         context = build_question_context(
             result,
             question,
-            int(os.getenv("OLLAMA_ASK_CONTEXT_MAX_CHARS", "16000")),
+            num_ctx=int(os.getenv("OLLAMA_ASK_NUM_CTX", "8192")),
+            num_predict=int(os.getenv("OLLAMA_ASK_NUM_PREDICT", "2000")),
+            evidence_num_predict=int(os.getenv("OLLAMA_ASK_EVIDENCE_NUM_PREDICT", "300")),
         )
+        logger.info(
+            "ASK_CONTEXT_LOADED job_id=%s ask_id=%s processing_attempt=%d page_count=%d context_chars=%d estimated_input_tokens=%d context_mode=%s section_count=%d",
+            job_id, ask_id, processing_attempt, len(context.page_numbers), len(context.text),
+            context.estimated_input_tokens, context.context_mode, context.source_chunk_count,
+        )
+        if not _set_processing_stage(question_table, job_id, ask_id, processing_owner, "WAITING_MODEL"):
+            return True
         effective_read_timeout = _effective_ollama_read_timeout(lambda_context)
         request_id = str(uuid.uuid4())
         ollama_started = time.monotonic()
         logger.info(
-            "ASK_OLLAMA_REQUEST_STARTED job_id=%s ask_id=%s processing_attempt=%d processing_owner=%s request_id=%s model=%s num_ctx=%s num_predict=%s read_timeout=%d context_chars=%d",
+            "ASK_OLLAMA_REQUEST_STARTED job_id=%s ask_id=%s processing_attempt=%d processing_owner=%s request_id=%s model=%s num_ctx=%s num_predict=%s read_timeout=%d context_mode=%s estimated_input_tokens=%d",
             job_id, ask_id, processing_attempt, processing_owner, request_id,
-            os.getenv("OLLAMA_MODEL", "qwen3-vl:8b-instruct"), os.getenv("OLLAMA_NUM_CTX", "16384"),
-            os.getenv("OLLAMA_ASK_NUM_PREDICT", "1000"), effective_read_timeout, len(context.text),
+            os.getenv("OLLAMA_ASK_MODEL", "qwen3-vl:8b-instruct"), os.getenv("OLLAMA_ASK_NUM_CTX", "8192"),
+            os.getenv("OLLAMA_ASK_NUM_PREDICT", "2000"), effective_read_timeout,
+            context.context_mode, context.estimated_input_tokens,
         )
         try:
-            answer = ask_ollama(question, context, _token(), effective_read_timeout)
+            answer = ask_ollama(
+                question, context, _token(), effective_read_timeout,
+                lambda_context=lambda_context, request_id=request_id,
+            )
         except QuestionModelError as exc:
             logger.warning(
                 "ASK_OLLAMA_REQUEST_FAILED job_id=%s ask_id=%s processing_attempt=%d request_id=%s duration_ms=%d error_category=%s http_status=%s",
@@ -467,6 +525,8 @@ def _process_message(record: dict, lambda_context=None) -> bool:
         logger.info("ASK_OLLAMA_REQUEST_COMPLETED job_id=%s ask_id=%s processing_attempt=%d request_id=%s duration_ms=%d",
                     job_id, ask_id, processing_attempt, request_id,
                     round((time.monotonic() - ollama_started) * 1000))
+        if not _set_processing_stage(question_table, job_id, ask_id, processing_owner, "SAVING_RESULT"):
+            return True
         completed = _complete_ask(
             question_table, job_id, ask_id, user_id, processing_owner, answer, context.context_limited
         )
@@ -484,7 +544,7 @@ def _process_message(record: dict, lambda_context=None) -> bool:
         )
         if exc.retryable and receive_count < int(os.getenv("SQS_MAX_RECEIVE_COUNT", "3")):
             _release_for_retry(question_table, job_id, ask_id, processing_owner)
-            retry_delay = _retry_delay(receive_count)
+            retry_delay = _retry_delay(receive_count, exc)
             _change_visibility(record, retry_delay, job_id, ask_id)
             logger.info("ASK_RETRY_SCHEDULED job_id=%s ask_id=%s processing_attempt=%d delay_seconds=%d error_category=%s",
                         job_id, ask_id, processing_attempt, retry_delay, exc.category)
@@ -493,6 +553,19 @@ def _process_message(record: dict, lambda_context=None) -> bool:
         if exc.retryable:
             _change_visibility(record, 0, job_id, ask_id)
         return bool(not exc.retryable)
+    except QuestionContextTooLarge:
+        context_value = locals().get("context")
+        logger.warning(
+            "ASK_CONTEXT_TOO_LARGE job_id=%s ask_id=%s estimated_input_tokens=%s num_ctx=%s",
+            job_id, ask_id, getattr(context_value, "estimated_input_tokens", None),
+            os.getenv("OLLAMA_ASK_NUM_CTX", "8192"),
+        )
+        _set_terminal_error(
+            question_table, job_id, ask_id, processing_owner,
+            "La transcripción completa excede el límite seguro de contexto y no se envió a la IA.",
+            "context_too_large",
+        )
+        return True
     except (IncompatibleDocumentResult, ValueError, json.JSONDecodeError) as exc:
         logger.warning("ASK_RESULT_INVALID job_id=%s ask_id=%s error_category=%s", job_id, ask_id, type(exc).__name__)
         _set_terminal_error(question_table, job_id, ask_id, processing_owner, "No se pudo leer el resultado de este documento.")

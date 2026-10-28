@@ -172,6 +172,8 @@
               Value: !Ref ProcessorMaxConcurrentJobs
             - Name: OLLAMA_READ_TIMEOUT
               Value: !Ref OllamaReadTimeout
+            - Name: OLLAMA_COORDINATOR_QUEUE_WAIT_SECONDS
+              Value: !Ref OllamaCoordinatorQueueWaitSeconds
             - Name: OLLAMA_NUM_CTX
               Value: !Ref OllamaNumCtx
             - Name: OLLAMA_PAGE_NUM_PREDICT

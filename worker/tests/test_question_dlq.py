@@ -31,7 +31,8 @@ class QuestionTable:
         ):
             raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
         self.item.update({
-            "status": values[":failed"], "error": values[":error"],
+            "status": values[":failed"], "processing_stage": values[":stage"],
+            "error": values[":error"],
             "error_category": values[":category"], "failed_at": values[":now_iso"],
             "updated_at": values[":now_iso"],
         })
@@ -62,7 +63,9 @@ def test_dlq_marks_abruptly_terminated_processing_ask_failed(monkeypatch):
 
     assert response == {"batchItemFailures": []}
     assert table.item["status"] == "FAILED"
+    assert table.item["processing_stage"] == "FAILED"
     assert table.item["error_category"] == "retry_exhausted"
+    assert table.calls[0]["ExpressionAttributeNames"]["#error"] == "error"
     assert "processing_owner" not in table.item
     assert "answer" not in table.item
 
